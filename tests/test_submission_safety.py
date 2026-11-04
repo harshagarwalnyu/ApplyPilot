@@ -280,3 +280,53 @@ def test_restart_quarantines_human_review(tmp_db, seed_job, reason):
     launcher.reset_failed()
     assert launcher.acquire_job(max_age_days=0) is None
     assert tuple(conn.execute("SELECT apply_status,state FROM jobs").fetchone()) == ("unconfirmed", "unconfirmed")
+
+
+def test_human_done_never_relaunches_or_requeues(tmp_db, seed_job):
+    from applypilot.apply.hitl import reset_needs_human
+    conn = tmp_db()
+    job = seed_job(conn, apply_status="needs_human")
+    assert launcher.acquire_job(worker_id=2, max_age_days=0) is None
+    reset_needs_human(job["url"])
+    # A crash immediately after Done leaves quarantine durable.
+    assert launcher.acquire_job(worker_id=3, max_age_days=0) is None
+    source = Path(__import__("applypilot.apply.hitl", fromlist=["x"]).__file__).read_text(encoding="utf-8")
+    assert 'last_result, last_dur, last_qs = run_job(' not in source
+
+
+@pytest.mark.parametrize("crash", [False, True])
+def test_hitl_done_quarantines_before_return(tmp_db, seed_job, monkeypatch, crash):
+    from applypilot.apply import hitl, human_review
+    conn = tmp_db()
+    seed_job(conn)
+    job = launcher.acquire_job(max_age_days=0)
+    def done(worker, event, job_hash):
+        assert launcher.acquire_job(worker_id=2, max_age_days=0) is None
+        event.set()
+        return 1234
+    monkeypatch.setattr(hitl, "_start_hitl_listener", done)
+    for name in ("_inject_banner_for_worker", "notify_human_needed", "_stop_hitl_listener",
+                 "_register_waiting", "_unregister_waiting"):
+        monkeypatch.setattr(hitl, name, lambda *a, **kw: None)
+    monkeypatch.setattr(human_review, "_start_done_watcher", lambda *a: None)
+    monkeypatch.setattr(hitl, "_stdin_fallback_lock", Mock(acquire=Mock(return_value=False)))
+    agent = Mock(side_effect=AssertionError("must never relaunch"))
+    monkeypatch.setattr(launcher, "run_job", agent)
+    original = hitl.reset_needs_human
+    def quarantine(url):
+        original(url)
+        assert launcher.acquire_job(worker_id=3, max_age_days=0) is None
+        if crash:
+            raise RuntimeError("crash after durable quarantine")
+    monkeypatch.setattr(hitl, "reset_needs_human", quarantine)
+    args = dict(worker_id=71, port=9999, job=job, reason="login_required",
+                instructions="review", navigate_url=job["application_url"], duration_ms=10)
+    if crash:
+        with pytest.raises(RuntimeError, match="durable quarantine"):
+            hitl._run_hitl(**args)
+    else:
+        assert hitl._run_hitl(**args)[0] == "unconfirmed"
+    agent.assert_not_called()
+    assert tuple(conn.execute("SELECT apply_status,state FROM jobs").fetchone()) == ("unconfirmed", "unconfirmed")
+
+

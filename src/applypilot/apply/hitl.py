@@ -509,7 +509,7 @@ def _run_hitl(
     update_state=None,
     stop_event=None,
 ) -> tuple[str, int, list[dict]] | None:
-    """Block on a needs_human pause; return the post-resume run_job result.
+    """Block on human review, then quarantine until explicit reconciliation.
 
     Replaces the two near-duplicate HITL paths in _worker_loop_body
     (generic + login_required). Steps:
@@ -522,11 +522,9 @@ def _run_hitl(
       6. notify_human_needed (desktop notification).
       7. Update worker state to "waiting_human".
       8. Wait on hitl_event with chrome-crash recovery.
-      9. reset_needs_human(...) — DB row back to its pre-pause state.
-      10. Re-launch agent on same Chrome, retry up to 3× on transient errors.
+      9. reset_needs_human(...) — quarantine the possible human submission.
 
-    Returns (result, duration_ms, screening_qs) from the post-resume run_job,
-    or None if no_hitl or stop was signaled.
+    Returns an unconfirmed result, or None if no_hitl or stop was signaled.
     """
     import hashlib
 
@@ -632,44 +630,9 @@ def _run_hitl(
                 logger.debug("Chrome relaunch during HITL failed", exc_info=True)
     _stop_hitl_listener(worker_id)
     _unregister_waiting(worker_id)
+    # Done means the human may have submitted. Keep the row protected and
+    # require reconciliation instead of launching another submitting agent.
+    reset_needs_human(job["url"])
     if stop_event is not None and stop_event.is_set():
         return None
-
-    # 9. Reset DB row.
-    reset_needs_human(job["url"])
-
-    # 9b. Pop the action log POSTed by the extension during the pause and
-    # format it for the agent's resume prompt (spec §4.4). If no log was
-    # posted (extension not ready, or user used the stdin fallback), this
-    # is a no-op and we resume without USER ACTIONS context.
-    with _action_log_cache_lock:
-        log_payload = _action_log_cache.pop(job_hash, None)
-    action_log_section = _format_action_log(log_payload) if log_payload else None
-
-    # 10. Re-launch agent with transient-error retry.
-    from applypilot.apply.launcher import run_job
-    last_result = None
-    last_dur = 0
-    last_qs: list[dict] = []
-    for _attempt in range(3):
-        if add_event:
-            add_event(f"[W{worker_id}] Human done, relaunching agent"
-                      f" (attempt {_attempt + 1}/3)...")
-        if update_state:
-            update_state(worker_id, status="applying",
-                         last_action=f"relaunching after HITL (attempt {_attempt + 1})",
-                         start_time=time.time(), actions=0)
-        last_result, last_dur, last_qs = run_job(
-            job, port=port, worker_id=worker_id,
-            model=model, dry_run=dry_run, skip_tab_reset=True,
-            extra_context=action_log_section)
-        _hitl_reason = last_result.split(":", 1)[-1] if ":" in last_result else last_result
-        if _hitl_reason not in _HITL_TRANSIENT_ERRORS:
-            break
-        if stop_event is not None and stop_event.is_set():
-            break
-        if _attempt < 2:
-            if add_event:
-                add_event(f"[W{worker_id}] Transient ({_hitl_reason}), retrying in 30s...")
-            time.sleep(30)
-    return last_result, last_dur, last_qs
+    return "unconfirmed", duration_ms or 0, []
