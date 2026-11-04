@@ -2411,7 +2411,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                          last_action="NO CREDITS")
             logger.error("Claude Code credits exhausted. Cannot auto-apply. "
                          "Top up at https://console.anthropic.com/settings/billing")
-            return "failed:credits_exhausted", duration_ms, []
+            return "unconfirmed", duration_ms, []
 
         # Parse ACCOUNT_CREATED lines and save to DB
         _parse_account_created(output, job.get("url"))
@@ -2516,12 +2516,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 save_path(job_ats, tool_calls,
                           job_url=job.get("application_url") or job_url,
                           duration_ms=duration_ms)
-            return "dry_run" if dry_run else "applied", duration_ms, screening_qs
+            return "applied" if inferred == "already_applied" else "unconfirmed", duration_ms, screening_qs
         if inferred:
             add_event(f"[W{worker_id}] INFERRED {inferred.upper()} ({elapsed}s): {(job.get('title') or '')[:30]}")
             update_state(worker_id, status="failed",
                          last_action=f"inferred:{inferred[:25]}")
-            return f"failed:{inferred}", duration_ms, screening_qs
+            return "unconfirmed", duration_ms, screening_qs
 
         add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
         update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")

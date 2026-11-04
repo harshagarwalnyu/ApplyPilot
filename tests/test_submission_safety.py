@@ -330,3 +330,7 @@ def test_hitl_done_quarantines_before_return(tmp_db, seed_job, monkeypatch, cras
     assert tuple(conn.execute("SELECT apply_status,state FROM jobs").fetchone()) == ("unconfirmed", "unconfirmed")
 
 
+@pytest.mark.parametrize("output", ["Clicked submit. session has now expired", "Clicked submit. insufficient credits", "Your application has been submitted successfully"])
+def test_missing_result_failure_phrase_is_quarantined(fake_run, output):
+    _, _, run = fake_run
+    assert run(output)[0][0] == "unconfirmed"
