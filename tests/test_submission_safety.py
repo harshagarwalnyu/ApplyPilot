@@ -246,3 +246,26 @@ def test_roster_io_precedes_write_transaction(tmp_db, seed_job, tmp_path, monkey
         return original()
     monkeypatch.setattr(launcher, "_load_exclusion_roster", load)
     assert launcher.acquire_job(max_age_days=0) is not None
+
+
+@pytest.mark.parametrize("status", ["applied", "unconfirmed", "in_progress", "needs_human", "excluded_roster", "manual"])
+@pytest.mark.parametrize("action", ["applied", "skip", "error", "reset"])
+def test_extension_rejects_protected_actions(tmp_db, seed_job, status, action):
+    import urllib.request
+    import urllib.error
+    conn = tmp_db()
+    job = seed_job(conn, apply_status=status)
+    port = launcher._start_worker_listener(70)
+    try:
+        request = urllib.request.Request(
+            f"http://localhost:{port}/api/jobs/mark",
+            data=json.dumps({"url": job["url"], "action": action}).encode(),
+            headers={"Content-Type": "application/json"})
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=5)
+        assert error.value.code == 409
+        assert conn.execute("SELECT apply_status FROM jobs").fetchone()[0] == status
+        with urllib.request.urlopen(f"http://localhost:{port}/api/jobs", timeout=5) as response:
+            assert json.load(response)["jobs"] == []
+    finally:
+        launcher._stop_worker_listener(70)

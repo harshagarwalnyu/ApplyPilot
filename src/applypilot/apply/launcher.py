@@ -703,7 +703,7 @@ def _start_worker_listener(worker_id: int, no_hitl: bool = False) -> int:
                     FROM jobs
                     WHERE fit_score IS NOT NULL AND fit_score >= 6
                       AND (apply_status IS NULL
-                           OR apply_status NOT IN ('applied', 'manual', 'in_progress'))
+                           OR apply_status IN ('failed', 'dry_run'))
                       AND (eligibility IS NULL OR eligibility = 'eligible')
                     ORDER BY fit_score DESC, discovered_at DESC
                     LIMIT ?
@@ -773,26 +773,50 @@ def _start_worker_listener(worker_id: int, no_hitl: bool = False) -> int:
                 conn = get_connection()
                 now = datetime.now(tz.utc).isoformat()
                 if action == "applied":
-                    conn.execute("""UPDATE jobs SET apply_status='applied', applied_at=?,
+                    cursor = conn.execute("""UPDATE jobs SET apply_status='applied', applied_at=?,
                         apply_category='applied', apply_attempts=COALESCE(apply_attempts,0)+1
-                        WHERE url=?""", (now, url))
+                        WHERE url=? AND (apply_status IS NULL OR apply_status IN ('failed', 'dry_run'))""", (now, url))
+                    if cursor.rowcount != 1:
+                        conn.rollback()
+                        self.send_response(409)
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        return
                     transition_state(conn, url, "applied",
                         reason="HTTP handler mark", force=True)
                 elif action == "skip":
-                    conn.execute("""UPDATE jobs SET apply_status='failed',
+                    cursor = conn.execute("""UPDATE jobs SET apply_status='failed',
                         apply_category='archived_ineligible',
-                        apply_error='manually skipped', apply_attempts=99 WHERE url=?""", (url,))
+                        apply_error='manually skipped', apply_attempts=99 WHERE url=? AND (apply_status IS NULL OR apply_status IN ('failed', 'dry_run'))""", (url,))
+                    if cursor.rowcount != 1:
+                        conn.rollback()
+                        self.send_response(409)
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        return
                     transition_state(conn, url, "manual_only",
                         reason="HTTP handler skip", force=True)
                 elif action == "error":
-                    conn.execute("""UPDATE jobs SET apply_status='failed',
+                    cursor = conn.execute("""UPDATE jobs SET apply_status='failed',
                         apply_category='archived_platform',
-                        apply_error='manually marked error', apply_attempts=99 WHERE url=?""", (url,))
+                        apply_error='manually marked error', apply_attempts=99 WHERE url=? AND (apply_status IS NULL OR apply_status IN ('failed', 'dry_run'))""", (url,))
+                    if cursor.rowcount != 1:
+                        conn.rollback()
+                        self.send_response(409)
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        return
                     transition_state(conn, url, "apply_failed",
                         reason="HTTP handler error", force=True)
                 elif action == "reset":
-                    conn.execute("""UPDATE jobs SET apply_status=NULL, apply_category='pending',
-                        apply_error=NULL, apply_attempts=0, agent_id=NULL WHERE url=?""", (url,))
+                    cursor = conn.execute("""UPDATE jobs SET apply_status=NULL, apply_category='pending',
+                        apply_error=NULL, apply_attempts=0, agent_id=NULL WHERE url=? AND (apply_status IS NULL OR apply_status IN ('failed', 'dry_run'))""", (url,))
+                    if cursor.rowcount != 1:
+                        conn.rollback()
+                        self.send_response(409)
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        return
                     transition_state(conn, url, "ready_to_apply",
                         reason="HTTP handler reset", force=True)
                 commit_with_retry(conn)
