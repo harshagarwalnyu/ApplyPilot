@@ -355,3 +355,13 @@ def test_dry_run_preserves_existing_application(fake_run, monkeypatch, output):
     launcher.mark_result(job["url"], status)
     launcher.reset_failed()
     assert conn.execute("SELECT apply_status FROM jobs").fetchone()[0] == "applied"
+
+
+@pytest.mark.parametrize("status", ["applied", "unconfirmed", "needs_human", "in_progress", "excluded_roster"])
+def test_cli_mark_failed_cannot_erase_protection(tmp_db, seed_job, status):
+    conn = tmp_db()
+    job = seed_job(conn, apply_status=status)
+    with pytest.raises(ValueError, match="reconciliation"):
+        launcher.mark_job(job["url"], "failed")
+    launcher.reset_failed()
+    assert conn.execute("SELECT apply_status FROM jobs").fetchone()[0] == status

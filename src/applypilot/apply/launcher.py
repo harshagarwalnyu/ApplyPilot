@@ -1937,22 +1937,26 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     if status == "applied":
-        _db_retry_execute(conn, """
+        cursor = _db_retry_execute(conn, """
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
                            apply_error = NULL, agent_id = NULL,
                            apply_category = 'applied'
-            WHERE url = ?
+            WHERE url = ? AND (apply_status IS NULL OR apply_status IN ('failed', 'dry_run', 'manual'))
         """, (now, url))
     else:
         error = reason or "manual"
         category = categorize_apply_result("failed", error)
-        _db_retry_execute(conn, """
+        cursor = _db_retry_execute(conn, """
             UPDATE jobs SET apply_status = 'failed', apply_error = ?,
                            apply_attempts = 99, agent_id = NULL,
                            apply_category = ?
-            WHERE url = ?
+            WHERE url = ? AND (apply_status IS NULL OR apply_status IN ('failed', 'dry_run', 'manual'))
         """, (error, category, url))
     
+    if cursor.rowcount != 1:
+        conn.rollback()
+        raise ValueError("Protected job requires explicit reconciliation")
+
     state_map = {
         "applied":      "applied",
         "failed":       "apply_failed",
