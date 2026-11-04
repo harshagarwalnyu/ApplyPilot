@@ -209,8 +209,8 @@ def test_chrome_gate_requires_verified_sentinel(monkeypatch, verified):
     response = Mock()
     response.read.return_value = b'{"webSocketDebuggerUrl":"ws://mock"}'
     monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: response)
-    assert chrome.inject_dry_run_gate(9999) is verified
-    ws.close.assert_called_once()
+    assert chrome.inject_dry_run_gate(9999) is False
+    ws.send.assert_not_called()
 
 
 def test_prompt_generation_lock_can_be_released(tmp_db, seed_job):
@@ -334,3 +334,12 @@ def test_hitl_done_quarantines_before_return(tmp_db, seed_job, monkeypatch, cras
 def test_missing_result_failure_phrase_is_quarantined(fake_run, output):
     _, _, run = fake_run
     assert run(output)[0][0] == "unconfirmed"
+
+
+def test_dry_run_popup_cannot_start_agent(fake_run):
+    # Exercise the real gate and run_job boundary without opening a browser:
+    # no agent means no new-tab or popup submit can occur.
+    _, _, run = fake_run
+    (status, _, _), popen = run("RESULT:APPLIED", dry_run=True)
+    assert status == "failed:dry_run_setup_error"
+    popen.assert_not_called()

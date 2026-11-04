@@ -117,92 +117,12 @@ def inject_dry_run_gate(cdp_port: int) -> bool:
     Returns True on success, False on any failure (in which case the
     caller must abort the job).
     """
-    import urllib.request
-    import websocket  # type: ignore
-
-    try:
-        # Browser-level WS endpoint (covers all targets via the dispatcher).
-        info = json.loads(urllib.request.urlopen(
-            f"http://localhost:{cdp_port}/json/version", timeout=3,
-        ).read())
-        browser_ws = info.get("webSocketDebuggerUrl")
-        if not browser_ws:
-            return False
-    except Exception:
-        logger.debug("dry_run_gate: could not fetch CDP /json/version", exc_info=True)
-        return False
-
-    msg_id = [0]
-
-    def _send(ws, method, params=None, session_id=None):
-        msg_id[0] += 1
-        req = {"id": msg_id[0], "method": method}
-        if params is not None:
-            req["params"] = params
-        if session_id is not None:
-            req["sessionId"] = session_id
-        ws.send(json.dumps(req))
-        # Drain until we see our response (skip events).
-        for _ in range(40):
-            raw = ws.recv()
-            try:
-                resp = json.loads(raw)
-            except Exception:
-                continue
-            if resp.get("id") == msg_id[0]:
-                return resp
-        return None
-
-    try:
-        ws = websocket.create_connection(browser_ws, timeout=5)
-    except Exception:
-        logger.debug("dry_run_gate: ws connect failed", exc_info=True)
-        return False
-
-    try:
-        # Find every page target so we can inject into each one.
-        targets_resp = _send(ws, "Target.getTargets") or {}
-        page_targets = [
-            t for t in (targets_resp.get("result", {}).get("targetInfos", []) or [])
-            if t.get("type") == "page"
-        ]
-        installed = 0
-        for tgt in page_targets:
-            attach = _send(ws, "Target.attachToTarget",
-                           {"targetId": tgt["targetId"], "flatten": True})
-            if not attach:
-                return False
-            sid = attach.get("result", {}).get("sessionId")
-            if not sid:
-                return False
-            try:
-                _send(ws, "Page.enable", session_id=sid)
-                registered = _send(ws, "Page.addScriptToEvaluateOnNewDocument",
-                      {"source": _DRY_RUN_GATE_JS}, session_id=sid)
-                if not registered or not registered.get("result", {}).get("identifier"):
-                    return False
-                # Also evaluate immediately so the current page is gated.
-                evaluated = _send(ws, "Runtime.evaluate",
-                      {"expression": _DRY_RUN_GATE_JS, "awaitPromise": False},
-                      session_id=sid)
-                if not evaluated or "exceptionDetails" in evaluated.get("result", {}) or "error" in evaluated:
-                    return False
-                verified = _send(ws, "Runtime.evaluate",
-                                 {"expression": "window.__ap_dry_run_gate_installed === true",
-                                  "returnByValue": True}, session_id=sid)
-                if not verified or verified.get("result", {}).get("result", {}).get("value") is not True:
-                    return False
-                installed += 1
-            finally:
-                # Best-effort detach so we don't leave a session pinned.
-                _send(ws, "Target.detachFromTarget", {"sessionId": sid})
-        logger.info("Installed dry-run submit-blocker on %d page target(s)", installed)
-        return installed > 0
-    finally:
-        try:
-            ws.close()
-        except Exception:
-            pass
+    # Page scripts cover only targets known at injection time. A popup can
+    # execute and submit before a polling watcher could protect it. Until a
+    # browser-wide, lifetime guard is available, reject setup before the
+    # agent runs (including when there are currently zero page targets).
+    logger.error("Dry-run disabled: future page targets cannot be safely gated")
+    return False
 
 
 def _patch_manifest_key(manifest_path: Path) -> None:
