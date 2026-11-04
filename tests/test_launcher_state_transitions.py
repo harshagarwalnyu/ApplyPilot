@@ -86,7 +86,7 @@ def test_mark_needs_human_transitions_to_needs_human(tmp_db, seed_job):
 # B2 — reset_needs_human → 'applying'
 # ---------------------------------------------------------------------------
 
-def test_reset_needs_human_transitions_to_applying(tmp_db, seed_job):
+def test_reset_needs_human_transitions_to_unconfirmed(tmp_db, seed_job):
     conn = tmp_db()
     row = _seed_needs_human(conn, seed_job, "nh-b2")
     url = row["url"]
@@ -95,10 +95,10 @@ def test_reset_needs_human_transitions_to_applying(tmp_db, seed_job):
     count = reset_needs_human(url=url)
 
     assert count == 1, f"Expected 1 row reset, got {count}"
-    assert current_state(conn, url) == "applying"
+    assert current_state(conn, url) == "unconfirmed"
     history = state_history(conn, url)
     reasons = [h["reason"] for h in history]
-    assert any("applying" in (r or "") or "needs_human resolved" in (r or "")
+    assert any("reconciliation" in (r or "")
                for r in reasons), (
         f"Expected transition reason mentioning 'applying' or 'resolved'; got {reasons}"
     )

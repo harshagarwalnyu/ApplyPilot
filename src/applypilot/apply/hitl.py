@@ -349,53 +349,26 @@ def mark_needs_human(url: str, reason: str, stuck_url: str,
 
 
 def reset_needs_human(url: str | None = None) -> int:
-    """Reset parked jobs (needs_human) back to NULL so they can be retried.
-
-    Args:
-        url: Reset a specific job URL. If None, resets all parked jobs.
-
-    Returns:
-        Number of jobs reset.
-    """
-    from applypilot.apply.launcher import _db_retry_execute, _db_retry_commit
+    """Quarantine human reviews until submission evidence is reconciled."""
+    from applypilot.apply.launcher import _db_retry_commit
     conn = get_connection()
-
-    if url:
-        cursor = _db_retry_execute(conn, """
-            UPDATE jobs SET apply_status = NULL,
-                           needs_human_reason = NULL,
-                           needs_human_url = NULL,
-                           needs_human_instructions = NULL,
-                           agent_id = NULL,
-                           apply_category = NULL
-            WHERE url = ? AND apply_status = 'needs_human'
-        """, (url,))
-        if cursor.rowcount:
-            transition_state(conn, url, "applying",
-                reason="needs_human resolved, re-acquired",
-                force=True)
-    else:
-        # Fetch URLs before updating so we can emit individual transitions.
-        urls_to_reset = [
-            r[0] for r in conn.execute(
-                "SELECT url FROM jobs WHERE apply_status = 'needs_human'"
-            ).fetchall()
-        ]
-        cursor = _db_retry_execute(conn, """
-            UPDATE jobs SET apply_status = NULL,
-                           needs_human_reason = NULL,
-                           needs_human_url = NULL,
-                           needs_human_instructions = NULL,
-                           agent_id = NULL,
-                           apply_category = NULL
-            WHERE apply_status = 'needs_human'
-        """)
-        for u in urls_to_reset:
-            transition_state(conn, u, "applying",
-                reason="needs_human resolved, re-acquired",
-                force=True)
-    _db_retry_commit(conn)
-    return cursor.rowcount
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        rows = conn.execute(
+            "SELECT url FROM jobs WHERE apply_status='needs_human'"
+            + (" AND url=?" if url else ""), (url,) if url else (),
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                "UPDATE jobs SET apply_status='unconfirmed', apply_category='unconfirmed', "
+                "agent_id=NULL WHERE url=? AND apply_status='needs_human'", (row[0],))
+            transition_state(conn, row[0], "unconfirmed",
+                             reason="human review requires reconciliation", force=True)
+        _db_retry_commit(conn)
+        return len(rows)
+    except Exception:
+        conn.rollback()
+        raise
 
 
 # ---------------------------------------------------------------------------

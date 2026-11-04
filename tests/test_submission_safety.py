@@ -269,3 +269,14 @@ def test_extension_rejects_protected_actions(tmp_db, seed_job, status, action):
             assert json.load(response)["jobs"] == []
     finally:
         launcher._stop_worker_listener(70)
+
+
+@pytest.mark.parametrize("reason", ["human submitted", "interrupted review", "no-hitl"])
+def test_restart_quarantines_human_review(tmp_db, seed_job, reason):
+    from applypilot.apply.hitl import reset_needs_human
+    conn = tmp_db()
+    seed_job(conn, apply_status="needs_human", needs_human_reason=reason)
+    assert reset_needs_human() == 1
+    launcher.reset_failed()
+    assert launcher.acquire_job(max_age_days=0) is None
+    assert tuple(conn.execute("SELECT apply_status,state FROM jobs").fetchone()) == ("unconfirmed", "unconfirmed")

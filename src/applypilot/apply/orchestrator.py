@@ -623,35 +623,11 @@ def main(limit: int = 1, target_url: str | None = None,
     console = Console()
     _prev_focus_mode: str | None = None  # set before workers start; restored in finally
 
-    # Re-queue any jobs stuck in needs_human from a previous session.
-    # Their Chrome windows are gone (killed by _kill_on_port() when workers start),
-    # so reset them to NULL so they get picked up as normal jobs.
-    _boot_conn = get_connection()
-    # P0.5 leak (d) from decision #31: pull URLs first, then bulk-update,
-    # then emit per-row state transitions back to ready_to_apply.
-    _nh_urls = [r[0] for r in _boot_conn.execute(
-        "SELECT url FROM jobs WHERE apply_status='needs_human'"
-    ).fetchall()]
-    _nh_count = len(_nh_urls)
-    if _nh_count > 0:
-        _boot_conn.execute(
-            "UPDATE jobs SET apply_status=NULL, apply_category=NULL, "
-            "needs_human_reason=NULL, needs_human_url=NULL, "
-            "needs_human_instructions=NULL WHERE apply_status='needs_human'"
-        )
-        for _nh_url in _nh_urls:
-            try:
-                transition_state(
-                    _boot_conn, _nh_url, "ready_to_apply",
-                    reason="startup re-queue from needs_human",
-                    force=True,
-                )
-            except Exception:
-                logger.debug("startup re-queue transition failed for %s",
-                             _nh_url[:60], exc_info=True)
-        commit_with_retry(_boot_conn)
-        console.print(f"[yellow]Re-queued {_nh_count} needs_human job(s) from previous session[/yellow]")
-        logger.info("Startup: re-queued %d needs_human jobs from previous session", _nh_count)
+    # A human may have submitted before the previous session ended.
+    from applypilot.apply.hitl import reset_needs_human
+    _nh_count = reset_needs_human()
+    if _nh_count:
+        logger.info("Startup: quarantined %d interrupted human reviews", _nh_count)
 
     if continuous:
         effective_limit = 0
