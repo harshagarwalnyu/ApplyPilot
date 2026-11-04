@@ -329,9 +329,6 @@ def _worker_loop_body(
                 elif result == "unconfirmed" or result == "dry_run":
                     mark_result(job["url"], result, duration_ms=duration_ms)
                     break
-                elif result == "applied" and dry_run:
-                    mark_result(job["url"], "dry_run", duration_ms=duration_ms)
-                    break
                 elif result == "applied":
                     mark_result(job["url"], "applied", duration_ms=duration_ms)
                     _record_job_history(worker_id, job, result, duration_ms)

@@ -2428,7 +2428,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             if f"RESULT:{result_status}" in output:
                 # Normalize SUCCESS/ALREADY_APPLIED -> applied (already applied counts as applied)
                 canonical = "applied" if result_status in ("SUCCESS", "ALREADY_APPLIED") else result_status.lower()
-                if dry_run and canonical == "applied":
+                if dry_run and canonical == "applied" and result_status != "ALREADY_APPLIED":
                     canonical = "dry_run"
                 # Mark Q&A outcomes based on application result
                 if canonical == "applied" and job_url:

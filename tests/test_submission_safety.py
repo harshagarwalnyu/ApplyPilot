@@ -343,3 +343,15 @@ def test_dry_run_popup_cannot_start_agent(fake_run):
     (status, _, _), popen = run("RESULT:APPLIED", dry_run=True)
     assert status == "failed:dry_run_setup_error"
     popen.assert_not_called()
+
+
+@pytest.mark.parametrize("output", ["RESULT:ALREADY_APPLIED", "You have already applied for this job"])
+def test_dry_run_preserves_existing_application(fake_run, monkeypatch, output):
+    from applypilot.apply import chrome
+    monkeypatch.setattr(chrome, "inject_dry_run_gate", lambda *a: True)
+    job, conn, run = fake_run
+    (status, _, _), _ = run(output, dry_run=True)
+    assert status == "applied"
+    launcher.mark_result(job["url"], status)
+    launcher.reset_failed()
+    assert conn.execute("SELECT apply_status FROM jobs").fetchone()[0] == "applied"
