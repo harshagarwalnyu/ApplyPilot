@@ -268,6 +268,9 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
 
     # Run migrations for any columns added after initial schema
     ensure_columns(conn)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_application_status ON jobs(application_url, apply_status, url)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_apply_order ON jobs(fit_score DESC, COALESCE(discovered_at, '') DESC, url)")
+    commit_with_retry(conn)
 
     # Backfill apply categories for existing rows
     backfill_categories(conn)

@@ -1684,11 +1684,11 @@ def acquire_job(target_url: str | None = None,
             # eligible to fire after the first applies. Skip any candidate
             # whose application_url matches another row that's already in
             # flight (applied, in_progress, or needs_human).
-            candidates = conn.execute(f"""
+            candidate_sql = f"""
                 SELECT j.url, j.title, j.site, j.application_url,
                        j.tailored_resume_path, j.fit_score, j.location,
                        j.full_description, j.cover_letter_path, j.company,
-                       j.strategy
+                       j.strategy, COALESCE(j.discovered_at, '') AS discovered_at
                 FROM jobs j
                 WHERE j.tailored_resume_path IS NOT NULL
                   AND (j.apply_status IS NULL OR j.apply_status = 'failed')
@@ -1710,8 +1710,25 @@ def acquire_job(target_url: str | None = None,
                         AND j2.url != j.url
                         AND j2.apply_status IN ('applied', 'unconfirmed', 'in_progress', 'needs_human')
                   )
-                ORDER BY j.fit_score DESC, j.discovered_at DESC, j.url
-            """, (min_score, *company_excl_params, *age_params)).fetchall()
+                {{page_filter}}
+                ORDER BY j.fit_score DESC, COALESCE(j.discovered_at, '') DESC, j.url
+                LIMIT 100
+            """
+
+            def fetch_page(after=None):
+                page_filter = ""
+                params = [min_score, *company_excl_params, *age_params]
+                if after is not None:
+                    page_filter = (
+                        "AND (j.fit_score < ? OR (j.fit_score = ? AND "
+                        "(COALESCE(j.discovered_at, '') < ? OR "
+                        "(COALESCE(j.discovered_at, '') = ? AND j.url > ?))))"
+                    )
+                    params.extend([after["fit_score"], after["fit_score"],
+                                   after["discovered_at"], after["discovered_at"], after["url"]])
+                return conn.execute(candidate_sql.format(page_filter=page_filter), params).fetchall()
+
+            candidates = fetch_page()
 
             # Build in-flight buckets once, reuse for every candidate.
             # Use resolve_company_key so Greenhouse/Workday jobs (NULL company,
@@ -1751,32 +1768,22 @@ def acquire_job(target_url: str | None = None,
             #
             # Stable sort preserves SQL ordering for ties — Python's
             # sorted() is guaranteed stable since 2.3.
-            candidates = sorted(
-                candidates,
-                key=lambda c: (
-                    _in_flight_count(resolve_company_key(dict(c))),
-                    -(c["fit_score"] or 0),
-                ),
-            )
-
-            # Pick first candidate whose company is under cap AND ATS lane is free.
             row = None
-            for cand in candidates:
-                if excluded(cand):
-                    continue
-                if over_cap(dict(cand)):
-                    continue
-                ats = detect_ats(cand["application_url"] or cand["url"] or "")
-                if ats is not None and ats in active_ats:
-                    continue
-                row = cand
-                break
-
-            if row is None and candidates:
-                logger.debug(
-                    "acquire_job: all %d candidates blocked (ATS lanes=%s, cap-blocked companies present)",
-                    len(candidates), active_ats,
-                )
+            while candidates:
+                # Advance using SQL order, before the page-local fairness sort.
+                after = candidates[-1]
+                for cand in sorted(candidates, key=lambda c: (
+                        _in_flight_count(resolve_company_key(dict(c))), -(c["fit_score"] or 0))):
+                    if excluded(cand) or over_cap(dict(cand)):
+                        continue
+                    ats = detect_ats(cand["application_url"] or cand["url"] or "")
+                    if ats is not None and ats in active_ats:
+                        continue
+                    row = cand
+                    break
+                if row is not None or len(candidates) < 100:
+                    break
+                candidates = fetch_page(after)
 
         if not row:
             commit_with_retry(conn)

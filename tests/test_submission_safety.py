@@ -397,3 +397,61 @@ def test_dead_owner_quarantine_fences_late_writes(tmp_db, seed_job, monkeypatch)
     assert not mark_needs_human(job["url"], "test", "url", "test", lease_token=owned["lease_token"])
     launcher.release_lock(job["url"], agent_started=False, lease_token=owned["lease_token"])
     assert tuple(conn.execute("SELECT apply_status,state FROM jobs").fetchone()) == ("unconfirmed", "unconfirmed")
+
+
+@pytest.mark.parametrize("excluded", [True, False])
+def test_bounded_candidate_pages_progress(tmp_db, seed_job, monkeypatch, excluded):
+    conn = tmp_db()
+    for index in range(205):
+        seed_job(conn, company="blocked", fit_score=10,
+                 application_url=f"https://example.org/{index}")
+    expected = seed_job(conn, company="allowed", fit_score=9,
+                        application_url="https://example.org/allowed")
+    if excluded:
+        monkeypatch.setattr(launcher, "_load_exclusion_roster", lambda: (set(), {("blocked", "seniorsoftwareengineer")}))
+    else:
+        monkeypatch.setattr(config, "get_company_limit", lambda key: (0 if key == "blocked" else -1, 30))
+    queries = []
+    conn.set_trace_callback(queries.append)
+    result = launcher.acquire_job(max_age_days=0)
+    assert result["url"] == expected["url"]
+    pages = [q for q in queries if "FROM jobs j" in q]
+    assert len(pages) == 3
+    assert all("LIMIT 100" in q for q in pages)
+    plan = conn.execute("EXPLAIN QUERY PLAN SELECT 1 FROM jobs WHERE application_url=? AND apply_status=?", ("x", "applied")).fetchall()
+    assert any("idx_jobs_application_status" in row[3] for row in plan)
+
+
+@pytest.mark.parametrize("duplicate_heavy", [False, True])
+def test_large_queue_concurrent_acquisition(tmp_db, seed_job, monkeypatch, duplicate_heavy):
+    from concurrent.futures import ThreadPoolExecutor
+    from applypilot.database import get_connection
+    conn = tmp_db()
+    template = seed_job(conn, apply_status="manual")
+    rows = []
+    for index in range(4000):
+        app_url = f"https://example.org/{index}"
+        rows.append((f"https://list.example/{index}", f"company-{index}", app_url,
+                     template["discovered_at"], None))
+        if duplicate_heavy and index < 3900:
+            rows.append((f"https://applied.example/{index}", f"company-{index}", app_url,
+                         template["discovered_at"], "applied"))
+    conn.executemany("INSERT INTO jobs (url,company,application_url,discovered_at,apply_status,"
+                     "title,site,fit_score,tailored_resume_path) "
+                     "VALUES (?,?,?,?,?,'Engineer','example',9,'/tmp/r.pdf')", rows)
+    conn.commit()
+    monkeypatch.setattr(launcher, "detect_ats", lambda *a: None)
+    def acquire(worker):
+        try:
+            return launcher.acquire_job(worker_id=worker, max_age_days=0)
+        finally:
+            get_connection().close()
+    start = time.monotonic()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        acquired = list(pool.map(acquire, range(4)))
+    elapsed = time.monotonic() - start
+    assert all(acquired)
+    assert len({job["application_url"] for job in acquired}) == 4
+    if duplicate_heavy:
+        assert all(int(job["application_url"].rsplit("/", 1)[1]) >= 3900 for job in acquired)
+    print(f"queue benchmark: duplicate_heavy={duplicate_heavy}, rows={len(rows)}, workers=4, seconds={elapsed:.3f}")
