@@ -21,7 +21,7 @@ def isolated_apply(monkeypatch):
     monkeypatch.setattr(launcher, "_roster_cache", None)
 
 
-@pytest.mark.parametrize("status", ["applied", "unconfirmed", "in_progress"])
+@pytest.mark.parametrize("status", ["applied", "unconfirmed", "in_progress", "needs_human"])
 def test_url_refuses_protected_status(tmp_db, seed_job, status, caplog):
     conn = tmp_db()
     job = seed_job(conn, apply_status=status)

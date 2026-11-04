@@ -1596,7 +1596,7 @@ def acquire_job(target_url: str | None = None,
                 LIMIT 1
             """, (target_url, target_url, like, like,
                   target_url, target_url)).fetchone()
-            if row and row["apply_status"] in ("applied", "unconfirmed", "in_progress", "excluded_roster"):
+            if row and row["apply_status"] in ("applied", "unconfirmed", "in_progress", "needs_human", "excluded_roster"):
                 logger.warning("Refusing --url job with apply_status=%s: %s", row["apply_status"], row["url"])
                 row = None
             if row and row["application_url"]:
