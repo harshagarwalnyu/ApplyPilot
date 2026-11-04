@@ -59,7 +59,6 @@ def _get_or_create_extension_key() -> str:
 _DRY_RUN_GATE_JS = r"""
 (function() {
   if (window.__ap_dry_run_gate_installed) return;
-  window.__ap_dry_run_gate_installed = true;
   // Block form submits outright.
   document.addEventListener('submit', e => {
     e.preventDefault();
@@ -96,6 +95,7 @@ _DRY_RUN_GATE_JS = r"""
       try { console.log('[ApplyPilot] dry-run: submit click blocked:', text); } catch (_) {}
     }
   }, true);
+  window.__ap_dry_run_gate_installed = true;
 })();
 """
 
@@ -115,7 +115,7 @@ def inject_dry_run_gate(cdp_port: int) -> bool:
     preventDefault'd before any handler runs.
 
     Returns True on success, False on any failure (in which case the
-    caller should fall back to the prompt-only override).
+    caller must abort the job).
     """
     import urllib.request
     import websocket  # type: ignore
@@ -171,18 +171,27 @@ def inject_dry_run_gate(cdp_port: int) -> bool:
             attach = _send(ws, "Target.attachToTarget",
                            {"targetId": tgt["targetId"], "flatten": True})
             if not attach:
-                continue
+                return False
             sid = attach.get("result", {}).get("sessionId")
             if not sid:
-                continue
+                return False
             try:
                 _send(ws, "Page.enable", session_id=sid)
-                _send(ws, "Page.addScriptToEvaluateOnNewDocument",
+                registered = _send(ws, "Page.addScriptToEvaluateOnNewDocument",
                       {"source": _DRY_RUN_GATE_JS}, session_id=sid)
+                if not registered or not registered.get("result", {}).get("identifier"):
+                    return False
                 # Also evaluate immediately so the current page is gated.
-                _send(ws, "Runtime.evaluate",
+                evaluated = _send(ws, "Runtime.evaluate",
                       {"expression": _DRY_RUN_GATE_JS, "awaitPromise": False},
                       session_id=sid)
+                if not evaluated or "exceptionDetails" in evaluated.get("result", {}) or "error" in evaluated:
+                    return False
+                verified = _send(ws, "Runtime.evaluate",
+                                 {"expression": "window.__ap_dry_run_gate_installed === true",
+                                  "returnByValue": True}, session_id=sid)
+                if not verified or verified.get("result", {}).get("result", {}).get("value") is not True:
+                    return False
                 installed += 1
             finally:
                 # Best-effort detach so we don't leave a session pinned.

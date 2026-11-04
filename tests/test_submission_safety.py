@@ -1,0 +1,248 @@
+"""Submission safety tests: no live browser, credentials, or agent process."""
+import io
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+from unittest.mock import Mock
+
+import pytest
+
+from applypilot.apply import launcher
+from applypilot import config
+
+
+@pytest.fixture(autouse=True)
+def isolated_apply(monkeypatch):
+    monkeypatch.delenv("APPLYPILOT_EXCLUDE_CSV", raising=False)
+    monkeypatch.setattr(config, "get_company_limit", lambda key: (-1, 30))
+    monkeypatch.setattr(launcher, "_load_blocked", lambda: ([], []))
+    monkeypatch.setattr(launcher, "_roster_cache", None)
+
+
+@pytest.mark.parametrize("status", ["applied", "unconfirmed", "in_progress"])
+def test_url_refuses_protected_status(tmp_db, seed_job, status, caplog):
+    conn = tmp_db()
+    job = seed_job(conn, apply_status=status)
+    assert launcher.acquire_job(target_url=job["url"]) is None
+    assert "Refusing --url" in caplog.text
+    assert conn.execute("SELECT apply_status FROM jobs").fetchone()[0] == status
+
+
+@pytest.mark.parametrize("targeted", [False, True])
+@pytest.mark.parametrize("match", ["url", "application_url", "role"])
+def test_roster_excludes_and_continues(tmp_db, seed_job, tmp_path, monkeypatch, match, targeted):
+    conn = tmp_db()
+    job = seed_job(conn, company="Acme, Inc.", title="Senior Engineer!", fit_score=10)
+    other = seed_job(conn, company="other", application_url="https://other.example/jobs/2", fit_score=9)
+    roster = tmp_path / "roster.csv"
+    url = job[match] + "?tracking=1#top" if match != "role" else "https://unrelated.example"
+    roster.write_text(f'url,company,title\n{url},ACME INC,senior engineer\n' if match == "role"
+                      else f'url,company,title\n{url},unrelated,unrelated\n', encoding="utf-8")
+    monkeypatch.setenv("APPLYPILOT_EXCLUDE_CSV", str(roster))
+    result = launcher.acquire_job(target_url=job["url"] if targeted else None, max_age_days=0)
+    assert result is None if targeted else result["url"] == other["url"]
+    assert conn.execute("SELECT apply_status FROM jobs WHERE url=?", (job["url"],)).fetchone()[0] == "excluded_roster"
+    assert launcher.acquire_job(target_url=job["url"]) is None
+
+
+@pytest.mark.parametrize("mode", ["missing", "stale", "unreadable", "invalid"])
+def test_roster_fails_closed(tmp_db, seed_job, tmp_path, monkeypatch, mode):
+    conn = tmp_db()
+    job = seed_job(conn)
+    roster = tmp_path / "roster.csv"
+    if mode != "missing":
+        roster.write_text("bad header\n" if mode == "invalid" else "url,company,title\n")
+    if mode == "stale":
+        os.utime(roster, (time.time() - 86401,) * 2)
+    if mode == "unreadable":
+        monkeypatch.setattr("builtins.open", Mock(side_effect=PermissionError("denied")))
+    monkeypatch.setenv("APPLYPILOT_EXCLUDE_CSV", str(roster))
+    assert launcher.acquire_job() is None
+    assert launcher.acquire_job(target_url=job["url"]) is None
+    assert conn.execute("SELECT apply_status FROM jobs").fetchone()[0] is None
+
+
+def test_unset_roster_unchanged(tmp_db, seed_job):
+    conn = tmp_db()
+    job = seed_job(conn)
+    assert launcher.acquire_job(max_age_days=0)["url"] == job["url"]
+
+
+def test_roster_cache_reload_and_freshness(tmp_path, monkeypatch):
+    roster = tmp_path / "roster.csv"
+    roster.write_text("url,company,title\nHTTPS://A/,A,B\n")
+    monkeypatch.setenv("APPLYPILOT_EXCLUDE_CSV", str(roster))
+    first = launcher._load_exclusion_roster()
+    assert launcher._load_exclusion_roster() is first
+    roster.write_text("url,company,title\nhttps://other.example/,C,D\n")
+    assert "https://other.example" in launcher._load_exclusion_roster()[0]
+    os.utime(roster, (time.time() - 86401,) * 2)
+    with pytest.raises(ValueError):
+        launcher._load_exclusion_roster()
+
+
+def test_stale_lock_is_unconfirmed(tmp_db, seed_job):
+    conn = tmp_db()
+    job = seed_job(conn, apply_status="in_progress", state="applying", last_attempted_at="2000-01-01 00:00:00")
+    assert launcher.acquire_job(max_age_days=0) is None
+    row = conn.execute("SELECT apply_status,state FROM jobs WHERE url=?", (job["url"],)).fetchone()
+    assert tuple(row) == ("unconfirmed", "unconfirmed")
+
+
+def test_interrupted_reconnect_is_unconfirmed(tmp_db, seed_job, monkeypatch):
+    from applypilot.apply import orchestrator
+    conn = tmp_db()
+    seed_job(conn, apply_status="in_progress", state="applying", agent_id="worker-99")
+    monkeypatch.setattr(orchestrator, "probe_existing_chrome", lambda *a: 123)
+    monkeypatch.setattr(orchestrator, "add_event", lambda *a: None)
+    assert orchestrator._probe_for_reconnect(99, 9999) == (123, None)
+    assert tuple(conn.execute("SELECT apply_status,state FROM jobs").fetchone()) == ("unconfirmed", "unconfirmed")
+
+
+@pytest.fixture
+def fake_run(tmp_db, seed_job, tmp_path, monkeypatch):
+    conn = tmp_db()
+    job = seed_job(conn, apply_status="in_progress", state="applying")
+    for name in ("APP_DIR", "LOG_DIR", "APPLY_WORKER_DIR"):
+        monkeypatch.setattr(config, name, tmp_path)
+    for name in ("_reset_browser_tabs", "reset_worker_dir", "_refresh_gmail_token", "update_state", "add_event", "_activate_agent_tab", "_parse_account_created", "_parse_qa_lines"):
+        monkeypatch.setattr(launcher, name, lambda *a, **kw: None)
+    monkeypatch.setattr(launcher.prompt_mod, "build_prompt", lambda **kw: "test prompt")
+    monkeypatch.setattr(launcher, "_make_mcp_config", lambda *a, **kw: {})
+    monkeypatch.setattr(launcher, "detect_ats", lambda *a: None)
+    monkeypatch.setattr(launcher, "_takeover_events", {})
+    monkeypatch.setattr("applypilot.database.mark_qa_outcome", lambda *a: None)
+    def run(output="", returncode=0, error=None, dry_run=False):
+        proc = Mock()
+        proc.stdin = io.StringIO()
+        proc.stdout = iter([json.dumps({"type": "result", "result": output})])
+        proc.returncode = returncode
+        proc.wait.side_effect = error
+        popen = Mock(return_value=proc)
+        monkeypatch.setattr(launcher.subprocess, "Popen", popen)
+        result = launcher.run_job(job, 9999, dry_run=dry_run)
+        return result, popen
+    return job, conn, run
+
+
+@pytest.mark.parametrize("output,code,error", [
+    ("RESULT:UNCONFIRMED:https://example.com", 0, None),
+    ("unparseable output", 0, None),
+    ("", -9, None),
+    ("", 1, None),
+    ("", 0, subprocess.TimeoutExpired("agent", 1)),
+    ("", 0, RuntimeError("crashed")),
+    ("RESULT:FAILED:unknown", 0, None),
+])
+def test_ambiguous_run_is_durable(fake_run, output, code, error):
+    job, conn, run = fake_run
+    (status, duration, _), _ = run(output, code, error)
+    assert status == "unconfirmed"
+    launcher.mark_result(job["url"], status, duration_ms=duration)
+    assert tuple(conn.execute("SELECT apply_status,state FROM jobs").fetchone()) == ("unconfirmed", "unconfirmed")
+
+
+def test_explicit_presubmit_failure(fake_run):
+    _, _, run = fake_run
+    assert run("RESULT:FAILED:not_eligible_location")[0][0] == "failed:not_eligible_location"
+
+
+@pytest.mark.parametrize("gate", [False, RuntimeError("injection failed"), True])
+def test_dry_run_gate_fail_closed(fake_run, monkeypatch, gate):
+    from applypilot.apply import chrome
+    job, conn, run = fake_run
+    inject = Mock(side_effect=gate) if isinstance(gate, Exception) else Mock(return_value=gate)
+    monkeypatch.setattr(chrome, "inject_dry_run_gate", inject)
+    (status, duration, _), popen = run("RESULT:APPLIED", dry_run=True)
+    if gate is True:
+        popen.assert_called_once()
+        assert status == "dry_run"
+    else:
+        popen.assert_not_called()
+        assert status == "failed:dry_run_setup_error"
+    launcher.mark_result(job["url"], status.split(":", 1)[0], duration_ms=duration)
+    assert conn.execute("SELECT apply_status FROM jobs").fetchone()[0] != "applied"
+
+
+def test_prompt_submit_once_and_captcha_preserved():
+    from applypilot.apply import prompt, hitl
+    source = Path(prompt.__file__).read_text(encoding="utf-8")
+    step = source.split("11. After submit:", 1)[1].split("\n", 1)[0]
+    assert "click Submit again" not in step
+    assert "Never click Submit/Apply a second time" in step
+    assert "RESULT:UNCONFIRMED:" in step
+    for line in ('capsolver_key = os.environ.get("CAPSOLVER_API_KEY", "")',
+                 '--- CAPTCHA DETECT ---', 'https://api.capsolver.com/createTask',
+                 'https://api.capsolver.com/getTaskResult'):
+        assert line in source
+    assert hitl._HITL_INSTRUCTIONS["captcha"] == (
+        "CAPTCHA DETECTED. Solve the CAPTCHA shown on the page, then click Done "
+        "to let the agent continue the application.")
+
+
+@pytest.mark.parametrize("verified", [False, True])
+def test_chrome_gate_requires_verified_sentinel(monkeypatch, verified):
+    from applypilot.apply import chrome
+    import websocket
+    ws = Mock()
+    pending = []
+    def send(raw):
+        request = json.loads(raw)
+        method = request["method"]
+        if method == "Target.getTargets":
+            result = {"targetInfos": [{"type": "page", "targetId": "page-1"}]}
+        elif method == "Target.attachToTarget":
+            result = {"sessionId": "session-1"}
+        elif method == "Page.addScriptToEvaluateOnNewDocument":
+            result = {"identifier": "gate-script"}
+        elif method == "Runtime.evaluate":
+            expression = request["params"]["expression"]
+            result = {"result": {"value": verified if expression.endswith("=== true") else None}}
+        else:
+            result = {}
+        pending.append(json.dumps({"id": request["id"], "result": result}))
+    ws.send.side_effect = send
+    ws.recv.side_effect = lambda: pending.pop(0)
+    monkeypatch.setattr(websocket, "create_connection", lambda *a, **kw: ws)
+    response = Mock()
+    response.read.return_value = b'{"webSocketDebuggerUrl":"ws://mock"}'
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: response)
+    assert chrome.inject_dry_run_gate(9999) is verified
+    ws.close.assert_called_once()
+
+
+def test_prompt_generation_lock_can_be_released(tmp_db, seed_job):
+    conn = tmp_db()
+    job = seed_job(conn, apply_status="in_progress", state="applying")
+    launcher.release_lock(job["url"], agent_started=False)
+    assert tuple(conn.execute("SELECT apply_status,state FROM jobs").fetchone()) == (None, "ready_to_apply")
+
+
+def test_unconfirmed_blocks_duplicate_application(tmp_db, seed_job):
+    conn = tmp_db()
+    seed_job(conn, apply_status="unconfirmed")
+    seed_job(conn, url_suffix="duplicate")
+    assert launcher.acquire_job(max_age_days=0) is None
+
+
+def test_url_cannot_bypass_duplicate_guard(tmp_db, seed_job):
+    conn = tmp_db()
+    seed_job(conn, apply_status="unconfirmed")
+    duplicate = seed_job(conn, url_suffix="target-duplicate")
+    assert launcher.acquire_job(target_url=duplicate["url"]) is None
+
+
+def test_roster_io_precedes_write_transaction(tmp_db, seed_job, tmp_path, monkeypatch):
+    conn = tmp_db()
+    seed_job(conn)
+    roster = tmp_path / "roster.csv"
+    roster.write_text("url,company,title\n")
+    monkeypatch.setenv("APPLYPILOT_EXCLUDE_CSV", str(roster))
+    original = launcher._load_exclusion_roster
+    def load():
+        assert not conn.in_transaction
+        return original()
+    monkeypatch.setattr(launcher, "_load_exclusion_roster", load)
+    assert launcher.acquire_job(max_age_days=0) is not None

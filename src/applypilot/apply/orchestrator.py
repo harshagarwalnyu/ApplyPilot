@@ -120,17 +120,18 @@ def _probe_for_reconnect(worker_id: int, port: int) -> tuple[int | None, str | N
             job_url = row["url"]
             apply_url = row["application_url"] or row["url"]
             title = row["title"] or apply_url
-            # Reset the lock so acquire_job() can re-acquire it normally
+            # The interrupted run may have submitted; never re-acquire it.
             conn.execute(
-                "UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url = ?",
+                "UPDATE jobs SET apply_status = 'unconfirmed', apply_category = 'unconfirmed', agent_id = NULL WHERE url = ?",
                 (job_url,),
             )
+            transition_state(conn, job_url, "unconfirmed", reason="worker interrupted", force=True)
             commit_with_retry(conn)
             add_event(
-                f"[W{worker_id}] Found interrupted job: {title[:40]} — will resume"
+                f"[W{worker_id}] Interrupted job needs confirmation: {title[:40]}"
             )
-            logger.info("[W%d] Interrupted job reset for reconnect: %s", worker_id, apply_url[:80])
-            return pid, apply_url
+            logger.info("[W%d] Interrupted job marked unconfirmed: %s", worker_id, apply_url[:80])
+            return pid, None
         else:
             add_event(f"[W{worker_id}] No interrupted job found — Chrome has next job")
             return pid, None
@@ -325,6 +326,12 @@ def _worker_loop_body(
                     failed += 1
                     _stop_event.set()
                     break
+                elif result == "unconfirmed" or result == "dry_run":
+                    mark_result(job["url"], result, duration_ms=duration_ms)
+                    break
+                elif result == "applied" and dry_run:
+                    mark_result(job["url"], "dry_run", duration_ms=duration_ms)
+                    break
                 elif result == "applied":
                     mark_result(job["url"], "applied", duration_ms=duration_ms)
                     _record_job_history(worker_id, job, result, duration_ms)
@@ -506,7 +513,7 @@ def _worker_loop_body(
                                      jobs_done=applied + failed)
 
         except KeyboardInterrupt:
-            release_lock(job["url"])
+            mark_result(job["url"], "unconfirmed", "worker interrupted")
             if _stop_event.is_set():
                 break
             add_event(f"[W{worker_id}] Job skipped (Ctrl+C)")
@@ -515,7 +522,7 @@ def _worker_loop_body(
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {type(e).__name__}: {str(e)[:35]}")
             _log_failed_attempt(job, f"launcher_error:{str(e)[:80]}", worker_id, 0, False)
-            release_lock(job["url"])
+            mark_result(job["url"], "unconfirmed", "worker crashed")
             failed += 1
             update_state(worker_id, jobs_failed=failed)
         finally:

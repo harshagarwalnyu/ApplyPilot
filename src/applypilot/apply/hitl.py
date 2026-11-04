@@ -121,7 +121,7 @@ _HITL_INSTRUCTIONS: dict[str, str] = {
     ),
     "stuck": (
         "FORM STUCK. The agent got stuck on a form element. Review the form, "
-        "fix any issues or stuck fields, and submit if possible. "
+        "fix any issues or stuck fields, and submit only if never submitted before. "
         "Click Done when done (even if you only unstuck it for the agent to retry)."
     ),
     "email_verification": (
@@ -136,12 +136,12 @@ _HITL_INSTRUCTIONS: dict[str, str] = {
     "form_stuck": (
         "COMPLETE THE APPLICATION FORM. The agent filled what it could but got stuck "
         "on a form element (usually a custom dropdown or validation error). "
-        "Review the form, fix missing fields, and submit. "
+        "Review the form, fix missing fields, and submit only if never submitted before. "
         "Click Done when the application is submitted."
     ),
     "screening_questions": (
         "ANSWER SCREENING QUESTIONS. The agent reached screening questions it wasn't "
-        "confident answering from your profile. Review and answer them, then submit. "
+        "confident answering from your profile. Review and answer them, then submit only if never submitted before. "
         "Click Done when finished."
     ),
     "security_concern": (
