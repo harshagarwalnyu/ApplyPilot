@@ -365,3 +365,35 @@ def test_cli_mark_failed_cannot_erase_protection(tmp_db, seed_job, status):
         launcher.mark_job(job["url"], "failed")
     launcher.reset_failed()
     assert conn.execute("SELECT apply_status FROM jobs").fetchone()[0] == status
+
+
+def test_live_long_running_worker_is_not_stolen(tmp_db, seed_job):
+    import socket
+    conn = tmp_db()
+    job = seed_job(conn)
+    owned = launcher.acquire_job(worker_id=1, max_age_days=0)
+    conn.execute("UPDATE jobs SET last_attempted_at='2000-01-01 00:00:00'")
+    conn.commit()
+    seed_job(conn, url_suffix="duplicate-live")
+    assert launcher._worker_may_be_alive(os.getpid(), socket.gethostname())
+    assert launcher.acquire_job(worker_id=2, max_age_days=0) is None
+    assert conn.execute("SELECT apply_status FROM jobs WHERE url=?", (job["url"],)).fetchone()[0] == "in_progress"
+    launcher.mark_result(job["url"], "failed", lease_token="wrong-generation")
+    assert conn.execute("SELECT apply_status FROM jobs WHERE url=?", (job["url"],)).fetchone()[0] == "in_progress"
+    launcher.mark_result(job["url"], "applied", lease_token=owned["lease_token"])
+    assert conn.execute("SELECT apply_status FROM jobs WHERE url=?", (job["url"],)).fetchone()[0] == "applied"
+
+
+def test_dead_owner_quarantine_fences_late_writes(tmp_db, seed_job, monkeypatch):
+    from applypilot.apply.hitl import mark_needs_human
+    conn = tmp_db()
+    job = seed_job(conn)
+    owned = launcher.acquire_job(max_age_days=0)
+    conn.execute("UPDATE jobs SET last_attempted_at='2000-01-01 00:00:00'")
+    conn.commit()
+    monkeypatch.setattr(launcher, "_worker_may_be_alive", lambda *a: False)
+    assert launcher.acquire_job(worker_id=2, max_age_days=0) is None
+    launcher.mark_result(job["url"], "failed", lease_token=owned["lease_token"])
+    assert not mark_needs_human(job["url"], "test", "url", "test", lease_token=owned["lease_token"])
+    launcher.release_lock(job["url"], agent_started=False, lease_token=owned["lease_token"])
+    assert tuple(conn.execute("SELECT apply_status,state FROM jobs").fetchone()) == ("unconfirmed", "unconfirmed")

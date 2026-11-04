@@ -1496,6 +1496,37 @@ def _roster_url(url: str) -> str:
     return re.sub(r"[?#].*$", "", url.strip().lower()).rstrip("/")
 
 
+def _worker_may_be_alive(pid, host) -> bool:
+    """Check the owning process, conservatively preserving unknown remote owners."""
+    import socket
+    if not pid:
+        return False  # Legacy locks have no durable owner; quarantine only.
+    if host != socket.gethostname():
+        return True
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, int(pid))
+        if not handle:
+            return ctypes.get_last_error() != 87  # access denied is not death
+        try:
+            code = wintypes.DWORD()
+            return not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == 259
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def acquire_job(target_url: str | None = None,
                 min_score: int | None = None,
                 max_score: int | None = None,
@@ -1559,20 +1590,18 @@ def acquire_job(target_url: str | None = None,
 
         # Quarantine stale locks: a crashed run may already have submitted.
         # Pull URLs first so canonical state and audit history agree.
-        stale_urls = [
-            r[0] for r in conn.execute("""
-                SELECT url FROM jobs
-                WHERE apply_status = 'in_progress'
-                  AND last_attempted_at IS NOT NULL
-                  AND datetime(last_attempted_at) < datetime('now', '-30 minutes')
-            """).fetchall()
-        ]
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'unconfirmed', apply_category = 'unconfirmed', agent_id = NULL
-            WHERE apply_status = 'in_progress'
-              AND last_attempted_at IS NOT NULL
+        stale_urls = []
+        for stale in conn.execute("""
+            SELECT url, worker_pid, worker_host FROM jobs
+            WHERE apply_status='in_progress' AND last_attempted_at IS NOT NULL
               AND datetime(last_attempted_at) < datetime('now', '-30 minutes')
-        """)
+        """).fetchall():
+            if _worker_may_be_alive(stale["worker_pid"], stale["worker_host"]):
+                continue
+            conn.execute("UPDATE jobs SET apply_status='unconfirmed', "
+                         "apply_category='unconfirmed', agent_id=NULL, lease_token=NULL "
+                         "WHERE url=? AND apply_status='in_progress'", (stale["url"],))
+            stale_urls.append(stale["url"])
         for stale_url in stale_urls:
             try:
                 transition_state(
@@ -1793,13 +1822,16 @@ def acquire_job(target_url: str | None = None,
             logger.info("Skipping manual ATS: %s", row["url"][:80])
             return None
 
+        import socket
+        import uuid
+        lease_token = uuid.uuid4().hex
         now = datetime.now(timezone.utc).isoformat()
         conn.execute("""
             UPDATE jobs SET apply_status = 'in_progress',
-                           agent_id = ?,
+                           agent_id = ?, worker_pid = ?, worker_host = ?, lease_token = ?,
                            last_attempted_at = ?
             WHERE url = ?
-        """, (f"worker-{worker_id}", now, row["url"]))
+        """, (f"worker-{worker_id}", os.getpid(), socket.gethostname(), lease_token, now, row["url"]))
 
         # Emit state transition: ready_to_apply → applying (force=True since
         # the in-flight job may currently be at apply_failed from a prior run).
@@ -1810,7 +1842,7 @@ def acquire_job(target_url: str | None = None,
 
         commit_with_retry(conn)
 
-        return dict(row)
+        return {**dict(row), "lease_token": lease_token}
     except Exception:
         conn.rollback()
         raise
@@ -1818,9 +1850,18 @@ def acquire_job(target_url: str | None = None,
 
 def mark_result(url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
-                task_id: str | None = None) -> None:
+                task_id: str | None = None, lease_token: str | None = None) -> None:
     """Update a job's apply status in the database + emit state transition."""
     conn = get_connection()
+    conn.execute("BEGIN IMMEDIATE")
+    current = conn.execute("SELECT apply_status,lease_token FROM jobs WHERE url=?", (url,)).fetchone()
+    if (not current or current["apply_status"] not in (None, "in_progress", "needs_human")
+            or current["lease_token"] != lease_token):
+        conn.rollback()
+        logger.warning("Ignoring fenced result for %s", url)
+        return
+    if current["apply_status"] == "needs_human" and status != "applied":
+        status = "unconfirmed"
     now = datetime.now(timezone.utc).isoformat()
     if status == "applied":
         _db_retry_execute(conn, """
@@ -1862,19 +1903,23 @@ def mark_result(url: str, status: str, error: str | None = None,
     _db_retry_commit(conn)
 
 
-def release_lock(url: str, *, agent_started: bool = True) -> None:
+def release_lock(url: str, *, agent_started: bool = True, lease_token: str | None = None) -> None:
     """Quarantine interrupted runs; only prompt generation can safely requeue."""
     if agent_started:
         conn = get_connection()
         row = conn.execute("SELECT apply_status FROM jobs WHERE url=?", (url,)).fetchone()
         if row and row[0] == "in_progress":
-            mark_result(url, "unconfirmed", "lock released after agent start")
+            mark_result(url, "unconfirmed", "lock released after agent start", lease_token=lease_token)
         return
     conn = get_connection()
-    _db_retry_execute(conn,
-        "UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url = ? AND apply_status = 'in_progress'",
-        (url,),
+    cursor = _db_retry_execute(conn,
+        "UPDATE jobs SET apply_status = NULL, agent_id = NULL, lease_token=NULL "
+        "WHERE url = ? AND apply_status = 'in_progress' AND lease_token IS ?",
+        (url, lease_token),
     )
+    if cursor.rowcount != 1:
+        conn.rollback()
+        return
     transition_state(conn, url, "ready_to_apply",
                      reason="lock released without submit",
                      force=True)
@@ -1910,7 +1955,7 @@ def gen_prompt(target_url: str, min_score: int | None = None, max_score: int | N
     prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text, worker_id=worker_id, doc_format=_doc_format)
 
     # Release the lock so the job stays available
-    release_lock(job["url"], agent_started=False)
+    release_lock(job["url"], agent_started=False, lease_token=job.get("lease_token"))
 
     # Write prompt file
     config.ensure_dirs()

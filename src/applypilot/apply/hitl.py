@@ -323,10 +323,17 @@ def _inject_banner_for_worker(worker_id: int, cdp_port: int, job: dict,
 # ---------------------------------------------------------------------------
 
 def mark_needs_human(url: str, reason: str, stuck_url: str,
-                     instructions: str, duration_ms: int | None = None) -> None:
+                     instructions: str, duration_ms: int | None = None,
+                     lease_token: str | None = None) -> bool:
     """Park a job for human review instead of marking it as failed."""
     from applypilot.apply.launcher import _db_retry_execute, _db_retry_commit
     conn = get_connection()
+    conn.execute("BEGIN IMMEDIATE")
+    current = conn.execute("SELECT apply_status,lease_token FROM jobs WHERE url=?", (url,)).fetchone()
+    if (not current or current["apply_status"] not in (None, "in_progress")
+            or current["lease_token"] != lease_token):
+        conn.rollback()
+        return False
     now = datetime.now(timezone.utc).isoformat()
     _db_retry_execute(conn, """
         UPDATE jobs SET apply_status = 'needs_human',
@@ -346,6 +353,7 @@ def mark_needs_human(url: str, reason: str, stuck_url: str,
                   "instructions": instructions[:200] if instructions else None},
         force=True)
     _db_retry_commit(conn)
+    return True
 
 
 def reset_needs_human(url: str | None = None) -> int:
@@ -529,7 +537,9 @@ def _run_hitl(
     import hashlib
 
     # 1. Persist the needs_human row.
-    mark_needs_human(job["url"], reason, navigate_url, instructions, duration_ms)
+    if not mark_needs_human(job["url"], reason, navigate_url, instructions, duration_ms,
+                            lease_token=job.get("lease_token")):
+        return "unconfirmed", duration_ms or 0, []
 
     # The popup's "no-hitl" toggle mutates worker_state["no_hitl"] live;
     # honor that in preference to the caller's CLI-time default so a user

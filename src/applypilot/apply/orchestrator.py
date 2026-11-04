@@ -111,12 +111,15 @@ def _probe_for_reconnect(worker_id: int, port: int) -> tuple[int | None, str | N
     try:
         conn = get_connection()
         row = conn.execute(
-            "SELECT url, application_url, title FROM jobs "
+            "SELECT url, application_url, title, worker_pid, worker_host FROM jobs "
             "WHERE apply_status = 'in_progress' AND agent_id = ? "
             "ORDER BY last_attempted_at DESC LIMIT 1",
             (f"worker-{worker_id}",),
         ).fetchone()
         if row:
+            from applypilot.apply.launcher import _worker_may_be_alive
+            if _worker_may_be_alive(row["worker_pid"], row["worker_host"]):
+                return None, None
             job_url = row["url"]
             apply_url = row["application_url"] or row["url"]
             title = row["title"] or apply_url
@@ -314,23 +317,23 @@ def _worker_loop_body(
                 relaunch = False
 
                 if result == "skipped":
-                    release_lock(job["url"])
+                    release_lock(job["url"], lease_token=job.get("lease_token"))
                     add_event(f"[W{worker_id}] Skipped: {(job.get('title') or '')[:30]}")
                     was_skipped = True
                     break
                 elif "credits_exhausted" in result:
                     reason = result.split(":", 1)[-1] if ":" in result else result
                     mark_result(job["url"], "failed", reason, permanent=True,
-                                duration_ms=duration_ms)
+                                duration_ms=duration_ms, lease_token=job.get("lease_token"))
                     _log_failed_attempt(job, reason, worker_id, duration_ms, True)
                     failed += 1
                     _stop_event.set()
                     break
                 elif result == "unconfirmed" or result == "dry_run":
-                    mark_result(job["url"], result, duration_ms=duration_ms)
+                    mark_result(job["url"], result, duration_ms=duration_ms, lease_token=job.get("lease_token"))
                     break
                 elif result == "applied":
-                    mark_result(job["url"], "applied", duration_ms=duration_ms)
+                    mark_result(job["url"], "applied", duration_ms=duration_ms, lease_token=job.get("lease_token"))
                     _record_job_history(worker_id, job, result, duration_ms)
                     applied += 1
                     update_state(worker_id, jobs_applied=applied,
@@ -502,7 +505,7 @@ def _worker_loop_body(
                     else:
                         perm = _is_permanent_failure(result)
                         mark_result(job["url"], "failed", reason,
-                                    permanent=perm, duration_ms=duration_ms)
+                                    permanent=perm, duration_ms=duration_ms, lease_token=job.get("lease_token"))
                         _log_failed_attempt(job, reason, worker_id, duration_ms, perm)
                         _record_job_history(worker_id, job, result, duration_ms)
                         failed += 1
@@ -510,7 +513,7 @@ def _worker_loop_body(
                                      jobs_done=applied + failed)
 
         except KeyboardInterrupt:
-            mark_result(job["url"], "unconfirmed", "worker interrupted")
+            mark_result(job["url"], "unconfirmed", "worker interrupted", lease_token=job.get("lease_token"))
             if _stop_event.is_set():
                 break
             add_event(f"[W{worker_id}] Job skipped (Ctrl+C)")
@@ -519,7 +522,7 @@ def _worker_loop_body(
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {type(e).__name__}: {str(e)[:35]}")
             _log_failed_attempt(job, f"launcher_error:{str(e)[:80]}", worker_id, 0, False)
-            mark_result(job["url"], "unconfirmed", "worker crashed")
+            mark_result(job["url"], "unconfirmed", "worker crashed", lease_token=job.get("lease_token"))
             failed += 1
             update_state(worker_id, jobs_failed=failed)
         finally:
