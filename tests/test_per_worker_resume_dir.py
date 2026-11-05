@@ -179,3 +179,21 @@ class TestDocFormatFallback:
         from applypilot.apply.prompt import PromptBuildError, build_prompt
         with pytest.raises(PromptBuildError):
             build_prompt(_build_job(resume_txt), tailored_resume="x", worker_id=0, doc_format="docx")
+
+
+class TestRelocationConfig:
+    @pytest.mark.parametrize("relocate", [True, False])
+    def test_relocation_follows_search_config(self, tmp_path, monkeypatch, relocate):
+        _setup_paths(tmp_path, monkeypatch)
+        resume_txt = _make_resume(tmp_path, "pdf")
+        _mock_db_calls(monkeypatch)
+        from applypilot import config as cfg
+        sc = cfg.load_search_config()
+        sc.setdefault("location", {})["willing_to_relocate"] = relocate
+        monkeypatch.setattr(cfg, "load_search_config", lambda: sc)
+
+        from applypilot.apply.prompt import build_prompt
+        prompt = build_prompt(_build_job(resume_txt), tailored_resume="x", worker_id=0, doc_format="pdf")
+        assert ("cannot relocate" in prompt) is not relocate
+        assert ("onsite anywhere in the US -> ELIGIBLE" in prompt) is relocate
+        assert "Seattle\" is an option" not in prompt

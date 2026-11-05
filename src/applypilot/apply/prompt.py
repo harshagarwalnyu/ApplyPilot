@@ -168,6 +168,15 @@ def _build_location_check(profile: dict, search_config: dict) -> str:
     else:
         city_list = primary_city
 
+    if location_cfg.get("willing_to_relocate"):
+        return """== LOCATION CHECK (do this FIRST before any form) ==
+The candidate will relocate anywhere in the United States. Read the job page, then decide:
+- Remote, hybrid or onsite anywhere in the US -> ELIGIBLE. Apply.
+- Remote but restricted to a non-US country (e.g. "remote - EU only") -> NOT ELIGIBLE. Output RESULT:FAILED:not_eligible_location
+- Job is in a non-US country -> NOT ELIGIBLE unless it explicitly says "US remote OK". Output RESULT:FAILED:not_eligible_location
+- Job requires fluency in a language the candidate doesn't speak (see Languages in profile) -> NOT ELIGIBLE. Output RESULT:FAILED:not_eligible_location
+- Cannot determine location -> Continue applying."""
+
     return f"""== LOCATION CHECK (do this FIRST before any form) ==
 Read the job page. Determine the work arrangement. Then decide:
 - "Remote" in the US or "work from anywhere" -> ELIGIBLE. Apply.
@@ -223,7 +232,7 @@ Decision tree:
 6. Hourly rate? -> Divide your annual answer by 2080. ({hourly_line})"""
 
 
-def _build_screening_section(profile: dict) -> str:
+def _build_screening_section(profile: dict, search_config: dict | None = None) -> str:
     """Build the screening questions guidance section."""
     personal = profile["personal"]
     exp = profile.get("experience", {})
@@ -231,10 +240,13 @@ def _build_screening_section(profile: dict) -> str:
     years = exp.get("years_of_experience_total", "multiple")
     target_role = exp.get("target_role", personal.get("current_job_title", "software engineer"))
     work_auth = profile["work_authorization"]
+    relocate = (search_config or {}).get("location", {}).get("willing_to_relocate")
+    relocation = ("willing to relocate anywhere in the US (answer Yes to relocation questions)"
+                  if relocate else "cannot relocate")
 
     return f"""== SCREENING QUESTIONS (be strategic) ==
 Hard facts -> answer truthfully from the profile. No guessing. This includes:
-  - Location/relocation: lives in {city}, cannot relocate
+  - Location/relocation: lives in {city}, {relocation}
   - Work authorization: {work_auth.get('legally_authorized_to_work', 'see profile')}
   - Citizenship, clearance, licenses, certifications: answer from profile only
   - Criminal/background: answer from profile only
@@ -621,7 +633,7 @@ def build_prompt(job: dict, tailored_resume: str,
     profile_summary = _build_profile_summary(profile)
     location_check = _build_location_check(profile, search_config)
     salary_section = _build_salary_section(profile)
-    screening_section = _build_screening_section(profile)
+    screening_section = _build_screening_section(profile, search_config)
     hard_rules = _build_hard_rules(profile)
     captcha_section = _build_captcha_section()
     qa_section = _build_qa_section(doc_format=doc_format)
@@ -652,6 +664,12 @@ def build_prompt(job: dict, tailored_resume: str,
     # Acceptable office locations (excludes "Remote" which is handled separately)
     location_accept = [p for p in location_cfg.get("accept_patterns", []) if p.lower() != "remote"]
     location_accept_priority = ", ".join(location_accept) if location_accept else location_primary
+    if location_cfg.get("willing_to_relocate"):
+        office_rule = ("  The candidate will relocate within the US: if no priority option is offered, pick any US "
+                       "office. Never pick a non-US location.")
+    else:
+        office_rule = ("  NEVER select locations outside the acceptable list (or any non-US city) even if they are "
+                       "the only options — those roles are not eligible.")
 
     # LinkedIn Easy Apply — configurable autocomplete behavior
     # linkedin_type_chars: how many leading characters to type one-by-one before
@@ -1112,9 +1130,9 @@ RESULT:FAILED:reason -- any other failure (brief reason)
   These ask which physical or remote location you are applying for.
   Selection priority order: {location_accept_priority}, Remote.
   Strategy: (1) snapshot the available options, (2) pick the FIRST acceptable match from the priority list.
-  If "Seattle" is an option → select it. If not, try Bellevue, Kirkland, Redmond in order. If none match, try "Remote" if offered.
+  If none of the priority list matches, try "Remote" if offered.
   If NONE of the acceptable locations are offered and it is a required field → output RESULT:FAILED:not_eligible_location.
-  NEVER select locations outside the acceptable list (e.g. Everett, Bothell, Renton, Tacoma, or any non-US city) even if they are the only options — those roles are not eligible.
+{office_rule}
 - LINKEDIN EASY APPLY — button visibility, location, email, and first name fields:
   The LinkedIn Easy Apply flow has several non-standard behaviors — treat them specially.
 
