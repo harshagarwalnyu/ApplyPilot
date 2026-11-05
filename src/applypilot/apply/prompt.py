@@ -636,10 +636,7 @@ def build_prompt(job: dict, tailored_resume: str,
     # and policies, kept out of code. Appended after the location check.
     rules_file = config.APP_DIR / "apply_rules.md"
     if rules_file.exists():
-        location_check += "
-
-== OWNER RULES ==
-" + rules_file.read_text(encoding="utf-8").strip()
+        location_check += "\n\n== OWNER RULES ==\n" + rules_file.read_text(encoding="utf-8").strip()
     salary_section = _build_salary_section(profile)
     screening_section = _build_screening_section(profile, search_config)
     hard_rules = _build_hard_rules(profile)
