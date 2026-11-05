@@ -524,6 +524,7 @@ def test_no_hitl_email_code_waits_and_passes_operator_code(tmp_db, seed_job, mon
                          instructions="verify", navigate_url=job["application_url"], duration_ms=10, no_hitl=True)
     assert out[0] == "applied"
     assert "code 482913" in agent.call_args.kwargs["extra_context"]
+    assert agent.call_args.kwargs["skip_tab_reset"] is True  # resume must not re-navigate
     assert "handback_instructions" not in launcher._worker_state[73]
 
 

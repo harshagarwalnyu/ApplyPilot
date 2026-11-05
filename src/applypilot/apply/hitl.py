@@ -680,8 +680,10 @@ def _run_hitl(
         if operator_note:
             context += ("\nOPERATOR NOTE (from the inbox; enter any code into the waiting field, or "
                         "browser_navigate to any link, then continue): " + operator_note)
+        # skip_tab_reset: start from the page as it is. Re-navigating to the job URL resets
+        # Oracle/Workday verification screens and voids the code the operator just read.
         return run_job(job, port=port, worker_id=worker_id, model=model, dry_run=dry_run,
-                       extra_context=context)
+                       skip_tab_reset=True, extra_context=context)
     # Done means the human may have submitted. Keep the row protected and
     # require reconciliation instead of launching another submitting agent.
     reset_needs_human(job["url"])
