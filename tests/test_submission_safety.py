@@ -464,3 +464,12 @@ def test_large_queue_concurrent_acquisition(tmp_db, seed_job, monkeypatch, dupli
 ])
 def test_roster_url_keeps_posting_ids(a, b, same):
     assert (launcher._roster_url(a) == launcher._roster_url(b)) is same
+
+
+def test_claude_login_failure_is_retryable_and_stops_run(fake_run, monkeypatch):
+    job, conn, run = fake_run
+    monkeypatch.setattr(launcher, "_stop_event", __import__("threading").Event())
+    (result, _dur, _qs), _ = run("Failed to authenticate: OAuth session expired and could not be refreshed", 1)
+    assert result == "failed:claude_auth"
+    assert launcher._stop_event.is_set()
+    assert not launcher._is_permanent_failure(result)

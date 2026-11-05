@@ -2460,6 +2460,18 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         if tev and tev.is_set():
             return "takeover", int((time.time() - start) * 1000), []
 
+        # The claude CLI could not log in: no tool ran, so nothing was submitted. Every
+        # later job would fail the same way, so stop the run and keep this job retryable.
+        raw = "\n".join(text_parts)
+        if not tool_calls and ("Failed to authenticate" in raw or "Invalid API key" in raw
+                               or "Please run /login" in raw):
+            add_event(f"[W{worker_id}] CLAUDE LOGIN FAILED. Run `claude` and /login, then restart.")
+            update_state(worker_id, status="failed", last_action="claude login failed")
+            logger.error("Claude Code CLI is not logged in (%s). Stopping all workers.",
+                         raw.strip().splitlines()[-1][:120] if raw.strip() else "no output")
+            _stop_event.set()
+            return "failed:claude_auth", int((time.time() - start) * 1000), []
+
         if returncode:
             return "unconfirmed", int((time.time() - start) * 1000), []
 
