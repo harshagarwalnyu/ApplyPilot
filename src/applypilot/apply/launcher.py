@@ -111,6 +111,12 @@ def set_effort(level: str | None) -> None:
     _effort = level
 
 
+def agent_config_dir() -> Path | None:
+    """The apply agent's own Claude config dir, once it has been logged in (holds its own credentials file)."""
+    d = config.APP_DIR / "claude-agent"
+    return d if (d / ".credentials.json").is_file() else None
+
+
 # Blocked sites loaded from config/sites.yaml
 def _load_blocked():
     from applypilot.config import load_blocked_sites
@@ -2293,6 +2299,16 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     # Claude Code subprocess — it would override interactive auth and hit
     # "credit balance is too low" on an unfunded API account.
     env.pop("ANTHROPIC_API_KEY", None)
+    # A dedicated Claude config dir keeps the owner's personal CLAUDE.md, hooks and settings
+    # out of the apply agent. It needs its own one-time login (see agent_config_dir).
+    agent_dir = agent_config_dir()
+    if agent_dir:
+        env["CLAUDE_CONFIG_DIR"] = str(agent_dir)
+    elif not getattr(run_job, "_warned_shared_config", False):
+        run_job._warned_shared_config = True
+        logger.warning("Apply agent is using the personal Claude config; run "
+                       "`set CLAUDE_CONFIG_DIR=%s && claude` and /login once to isolate it.",
+                       config.APP_DIR / "claude-agent")
 
     # worker_dir was wiped+recreated above, before build_prompt populated it.
     worker_dir = config.APPLY_WORKER_DIR / f"worker-{worker_id}"
@@ -2494,6 +2510,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         job_log = config.LOG_DIR / f"claude_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
+        if stats:
+            output += (f"\n\nUSAGE: turns={stats.get('turns', '?')} input={stats.get('input_tokens', 0)} "
+                       f"output={stats.get('output_tokens', 0)} cache_read={stats.get('cache_read', 0)} "
+                       f"cache_create={stats.get('cache_create', 0)} cost_usd={stats.get('cost_usd', 0):.4f}")
         job_log.write_text(output, encoding="utf-8")
 
         if stats:
