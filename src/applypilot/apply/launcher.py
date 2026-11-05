@@ -100,6 +100,17 @@ def set_doc_format(fmt: str) -> None:
     _doc_format = fmt
 
 
+# Claude Code --effort for the apply agent (low|medium|high|xhigh|max). None = the CLI's
+# own default from ~/.claude/settings.json. Set once by the CLI before workers start.
+_effort: str | None = None
+
+
+def set_effort(level: str | None) -> None:
+    """Set the reasoning effort passed to the apply agent's claude subprocess."""
+    global _effort
+    _effort = level
+
+
 # Blocked sites loaded from config/sites.yaml
 def _load_blocked():
     from applypilot.config import load_blocked_sites
@@ -2270,6 +2281,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         "--output-format", "stream-json",
         "--verbose", "-",
     ]
+    if _effort:
+        cmd[3:3] = ["--effort", _effort]
 
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)

@@ -195,7 +195,8 @@ def apply(
         ),
     ),
     max_score: Optional[int] = typer.Option(None, "--max-score", help="Maximum fit score for job selection (useful for testing on lower-score jobs)."),
-    model: str = typer.Option("sonnet", "--model", "-m", help="Claude model name (sonnet | haiku | opus)."),
+    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name (haiku | sonnet | opus)."),
+    effort: str = typer.Option("high", "--effort", help="Claude reasoning effort: low | medium | high | xhigh | max."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
@@ -279,8 +280,9 @@ def apply(
         raise typer.Exit(code=1)
 
     # Set doc format for apply workers
-    from applypilot.apply.launcher import set_doc_format
+    from applypilot.apply.launcher import set_doc_format, set_effort
     set_doc_format(doc_format)
+    set_effort(effort)
 
     # Check 1: Tier 3 required (Claude Code CLI + Chrome)
     check_tier(3, "auto-apply")
