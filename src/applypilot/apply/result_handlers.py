@@ -185,7 +185,7 @@ PERMANENT_FAILURES: set[str] = {
     "not_eligible_location", "not_eligible_salary",
     "already_applied", "not_a_job_application", "unsafe_permissions",
     "unsafe_verification", "contract_only",
-    "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare", "not_eligible_internship",
+    "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare", "not_eligible_internship", "no_sponsorship_history",
     "credits_exhausted", "file_upload_blocked",
     "account_creation_broken", "page_error",
     "application_limit_exceeded",

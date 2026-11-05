@@ -2595,7 +2595,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                  last_action=f"FAILED: {reason[:25]}")
                     pre_submit = ("expired", "login_required", "not_eligible_location",
                                   "not_eligible_salary", "not_a_job_application",
-                                  "dry_run_setup_error", "contract_only", "not_eligible_internship")
+                                  "dry_run_setup_error", "contract_only", "not_eligible_internship", "no_sponsorship_history")
                     if reason not in pre_submit and reason not in HITL_AUTO_ROUTE:
                         return "unconfirmed", duration_ms, screening_qs
                     return f"failed:{reason}", duration_ms, screening_qs
