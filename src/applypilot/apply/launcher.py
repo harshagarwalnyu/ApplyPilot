@@ -1492,8 +1492,25 @@ def _roster_text(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
+# Query params that name the posting. Everything else (utm_*, source, ref, ...) is dropped.
+# An ID param missing here only makes the roster over-exclude (safe), never miss a duplicate.
+_POSTING_ID_PARAMS = {"gh_jid", "jid", "jobid", "job_id", "job", "id", "pid", "postingid",
+                      "reqid", "req_id", "requisitionid", "jobreqid", "jobpostingid", "positionid"}
+
+
 def _roster_url(url: str) -> str:
-    return re.sub(r"[?#].*$", "", url.strip().lower()).rstrip("/")
+    """Compare key for the exclusion roster: no fragment, only posting-ID query params.
+
+    Query params that identify the posting stay (gh_jid, jobId, ...): many career sites
+    serve every job from one path, and dropping the query made them all collide.
+    """
+    from urllib.parse import parse_qsl, urlencode, urlsplit
+
+    parts = urlsplit(url.strip().lower())
+    query = sorted((k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                   if k in _POSTING_ID_PARAMS)
+    base = f"{parts.scheme}://{parts.netloc}{parts.path}".rstrip("/") if parts.netloc else parts.path.rstrip("/")
+    return f"{base}?{urlencode(query)}" if query else base
 
 
 def _worker_may_be_alive(pid, host) -> bool:

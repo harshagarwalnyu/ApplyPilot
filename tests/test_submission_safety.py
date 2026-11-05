@@ -455,3 +455,12 @@ def test_large_queue_concurrent_acquisition(tmp_db, seed_job, monkeypatch, dupli
     if duplicate_heavy:
         assert all(int(job["application_url"].rsplit("/", 1)[1]) >= 3900 for job in acquired)
     print(f"queue benchmark: duplicate_heavy={duplicate_heavy}, rows={len(rows)}, workers=4, seconds={elapsed:.3f}")
+
+
+@pytest.mark.parametrize("a,b,same", [
+    ("https://stripe.com/jobs/search?gh_jid=8128745", "https://stripe.com/jobs/search?gh_jid=8128744", False),
+    ("https://stripe.com/jobs/search?gh_jid=8128745&utm_source=x", "https://Stripe.com/jobs/search?gh_jid=8128745#apply", True),
+    ("https://jobs.lever.co/acme/123/apply/", "https://jobs.lever.co/acme/123/apply?lever-source=linkedin", True),
+])
+def test_roster_url_keeps_posting_ids(a, b, same):
+    assert (launcher._roster_url(a) == launcher._roster_url(b)) is same
