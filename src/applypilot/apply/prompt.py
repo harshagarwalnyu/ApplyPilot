@@ -247,6 +247,8 @@ def _build_screening_section(profile: dict, search_config: dict | None = None) -
     return f"""== SCREENING QUESTIONS (be strategic) ==
 Hard facts -> answer truthfully from the profile. No guessing. This includes:
   - Location/relocation: lives in {city}, {relocation}
+  - Highest education / highest degree (even when worded "completed"): select Bachelor's (in progress, expected graduation May 2027). Never pick High School/GED.
+  - "Are you currently employed?": Yes only if the TAILORED RESUME lists a role whose end date is "Present"; otherwise No.
   - Work authorization: {work_auth.get('legally_authorized_to_work', 'see profile')}
   - Citizenship, clearance, licenses, certifications: answer from profile only
   - Criminal/background: answer from profile only
@@ -719,7 +721,12 @@ def build_prompt(job: dict, tailored_resume: str,
     if dry_run:
         submit_instruction = "IMPORTANT: Do NOT click the final Submit/Apply button. Review the form, verify all fields, then output RESULT:APPLIED with a note that this was a dry run."
     else:
-        submit_instruction = "BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. If anything is wrong or missing, fix it FIRST. Only click Submit after confirming everything is correct."
+        submit_instruction = ("BEFORE clicking Submit/Apply (on the final review page when there is one), take a snapshot and re-check EVERY "
+                              "field against the APPLICANT PROFILE and TAILORED RESUME: name, email, phone, address, work auth and sponsorship, "
+                              "every work-experience entry with its dates, every education entry with degree and graduation date, highest education "
+                              "(Bachelor's), resume file, cover letter, and every screening answer. If anything is wrong or missing, go back "
+                              "(Edit / Back), fix it, and re-check the review page again. Click Submit only when nothing is wrong. In your final "
+                              "message, list every field you corrected.")
 
     # Look up the per-ATS successful-path memo. If present, the prompt
     # gets a "PRIOR SUCCESSFUL PATH" section that summarizes the tool-call
@@ -994,6 +1001,7 @@ in the KNOWN SCREENING ANSWERS section. The form will still be open in the brows
 8. Check ALL pre-filled fields. ATS systems parse your resume and auto-fill -- it's often WRONG.
    - "Current Job Title" or "Most Recent Title" -> use the title from the TAILORED RESUME summary, NOT whatever the parser guessed.
    - Compare every other field to the APPLICANT PROFILE. Fix mismatches. Fill empty fields.
+   - Saved data from an existing ATS account (Workday "My Experience", iCIMS profile, etc.) is NOT trusted: every work-experience entry (employer, title, start/end month+year, "current job" box) and every education entry (school, degree, field, graduation date) must match the TAILORED RESUME exactly. Edit wrong entries, delete entries not on the resume, add missing ones. Never leave known-wrong data in place, even in optional fields.
 9. Answer screening questions using the rules above.
 10. {submit_instruction}
 11. After submit: browser_snapshot. Run CAPTCHA DETECT -- submit buttons often trigger invisible CAPTCHAs. If found, solve it (the form will auto-submit once the token clears). Never click Submit/Apply a second time. If no confirmation appears after the single click, output RESULT:UNCONFIRMED:{{url}}. Then check for new tabs (browser_tabs action: "list"). Switch to newest, close old. Snapshot to confirm submission. Look for "thank you" or "application received".
