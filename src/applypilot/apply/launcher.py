@@ -1420,12 +1420,8 @@ def _make_mcp_config(cdp_port: int, worker_id: int = 0) -> dict:
                     f"--user-agent={_get_real_user_agent()}",
                 ],
             },
-            "gmail": {
-                "command": "npx",
-                # Pinned: this package holds the Gmail OAuth tokens. 1.1.11
-                # verified byte-identical to the registry tarball 2026-06-10.
-                "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp@1.1.11"],
-            },
+            # No Gmail server: the owner refuses OAuth; emailed codes come from the
+            # operator via /api/done (hitl.OPERATOR_REASONS).
         }
     }
 
@@ -2257,8 +2253,6 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             f"{agent_prompt}"
         )
 
-    # Refresh Gmail token before writing MCP config (the MCP server doesn't auto-refresh)
-    _refresh_gmail_token()
 
     # Write per-worker MCP config
     mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
