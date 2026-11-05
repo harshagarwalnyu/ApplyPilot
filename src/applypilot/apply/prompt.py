@@ -247,8 +247,6 @@ def _build_screening_section(profile: dict, search_config: dict | None = None) -
     return f"""== SCREENING QUESTIONS (be strategic) ==
 Hard facts -> answer truthfully from the profile. No guessing. This includes:
   - Location/relocation: lives in {city}, {relocation}
-  - Highest education / highest degree (even when worded "completed"): select Bachelor's (in progress, expected graduation May 2027). Never pick High School/GED.
-  - "Are you currently employed?": Yes only if the TAILORED RESUME lists a role whose end date is "Present"; otherwise No.
   - Work authorization: {work_auth.get('legally_authorized_to_work', 'see profile')}
   - Citizenship, clearance, licenses, certifications: answer from profile only
   - Criminal/background: answer from profile only
@@ -634,6 +632,14 @@ def build_prompt(job: dict, tailored_resume: str,
     # --- Build all prompt sections ---
     profile_summary = _build_profile_summary(profile)
     location_check = _build_location_check(profile, search_config)
+    # Owner-maintained rules file (~/.applypilot/apply_rules.md): candidate-specific answers
+    # and policies, kept out of code. Appended after the location check.
+    rules_file = config.APP_DIR / "apply_rules.md"
+    if rules_file.exists():
+        location_check += "
+
+== OWNER RULES ==
+" + rules_file.read_text(encoding="utf-8").strip()
     salary_section = _build_salary_section(profile)
     screening_section = _build_screening_section(profile, search_config)
     hard_rules = _build_hard_rules(profile)
@@ -723,8 +729,8 @@ def build_prompt(job: dict, tailored_resume: str,
     else:
         submit_instruction = ("BEFORE clicking Submit/Apply (on the final review page when there is one), take a snapshot and re-check EVERY "
                               "field against the APPLICANT PROFILE and TAILORED RESUME: name, email, phone, address, work auth and sponsorship, "
-                              "every work-experience entry with its dates, every education entry with degree and graduation date, highest education "
-                              "(Bachelor's), resume file, cover letter, and every screening answer. If anything is wrong or missing, go back "
+                              "every work-experience entry with its dates, every education entry with degree and graduation date, highest education, "
+                              "resume file, cover letter, and every screening answer. If anything is wrong or missing, go back "
                               "(Edit / Back), fix it, and re-check the review page again. Click Submit only when nothing is wrong. In your final "
                               "message, list every field you corrected.")
 
