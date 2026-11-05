@@ -33,6 +33,7 @@ from rich.console import Console
 from rich.live import Live
 
 from applypilot import config
+from applypilot.apply.prompt import PromptBuildError
 from applypilot.apply.chrome import (
     BASE_CDP_PORT,
     _AdoptedChromeProcess,
@@ -522,7 +523,11 @@ def _worker_loop_body(
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {type(e).__name__}: {str(e)[:35]}")
             _log_failed_attempt(job, f"launcher_error:{str(e)[:80]}", worker_id, 0, False)
-            mark_result(job["url"], "unconfirmed", "worker crashed", lease_token=job.get("lease_token"))
+            if isinstance(e, PromptBuildError):
+                # Nothing was sent to the agent, so no submit can have happened: retryable failure.
+                mark_result(job["url"], "failed", f"prompt_build:{str(e)[:120]}", lease_token=job.get("lease_token"))
+            else:
+                mark_result(job["url"], "unconfirmed", "worker crashed", lease_token=job.get("lease_token"))
             failed += 1
             update_state(worker_id, jobs_failed=failed)
         finally:

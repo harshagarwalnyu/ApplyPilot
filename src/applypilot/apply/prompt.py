@@ -545,6 +545,10 @@ def _build_qa_section(doc_format: str | None = None) -> str:
     return "\n".join(lines)
 
 
+class PromptBuildError(ValueError):
+    """The prompt could not be built; raised before any browser action, so the job is safe to retry."""
+
+
 def build_prompt(job: dict, tailored_resume: str,
                  cover_letter: str | None = None,
                  dry_run: bool = False,
@@ -570,14 +574,20 @@ def build_prompt(job: dict, tailored_resume: str,
     personal = profile["personal"]
 
     # --- Resolve resume document path ---
-    doc_ext = f".{doc_format}"
     resume_path = job.get("tailored_resume_path")
     if not resume_path:
-        raise ValueError(f"No tailored resume for job: {job.get('title', 'unknown')}")
+        raise PromptBuildError(f"No tailored resume for job: {job.get('title', 'unknown')}")
 
-    src_doc = Path(resume_path).with_suffix(doc_ext).resolve()
+    src_doc = Path(resume_path).with_suffix(f".{doc_format}").resolve()
     if not src_doc.exists():
-        raise ValueError(f"Resume {doc_format.upper()} not found: {src_doc}")
+        # Use the other format when only that one exists (e.g. PDF-only resume folders).
+        other = "pdf" if doc_format == "docx" else "docx"
+        alt = src_doc.with_suffix(f".{other}")
+        if not alt.exists():
+            raise PromptBuildError(f"Resume {doc_format.upper()} not found: {src_doc}")
+        logger.warning("Resume %s not found, using %s: %s", doc_format.upper(), other.upper(), alt)
+        doc_format, src_doc = other, alt
+    doc_ext = f".{doc_format}"
 
     # Copy to a clean filename for upload (recruiters see the filename)
     full_name = personal["full_name"]
