@@ -35,6 +35,10 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+# Blocks that sit before the form: the human only signs in or completes an emailed
+# code/link, so on Done the agent is relaunched instead of quarantining the job.
+RESUMABLE_REASONS = frozenset({"login_required", "email_verification", "login_issue"})
+
 from applypilot import config
 from applypilot.apply.chrome import (
     HITL_LISTEN_BASE_PORT,
@@ -640,6 +644,19 @@ def _run_hitl(
                 logger.debug("Chrome relaunch during HITL failed", exc_info=True)
     _stop_hitl_listener(worker_id)
     _unregister_waiting(worker_id)
+    if reason in RESUMABLE_REASONS and not (stop_event is not None and stop_event.is_set()):
+        # The block was before the form (sign-in / emailed code or link): the human only
+        # got past it, so nothing can have been submitted. Send the agent back in.
+        from applypilot.apply.launcher import _db_retry_commit, run_job
+        conn = get_connection()
+        conn.execute("UPDATE jobs SET apply_status='in_progress' WHERE url=? AND apply_status='needs_human'",
+                     (job["url"],))
+        _db_retry_commit(conn)
+        if add_event:
+            add_event(f"[W{worker_id}] Resuming after {reason}")
+        return run_job(job, port=port, worker_id=worker_id, model=model, dry_run=dry_run,
+                       extra_context=f"The operator has resolved '{reason}' (signed in or completed the "
+                                     "emailed verification/reset). Continue the application from where it is.")
     # Done means the human may have submitted. Keep the row protected and
     # require reconciliation instead of launching another submitting agent.
     reset_needs_human(job["url"])

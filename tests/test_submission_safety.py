@@ -319,7 +319,7 @@ def test_hitl_done_quarantines_before_return(tmp_db, seed_job, monkeypatch, cras
         if crash:
             raise RuntimeError("crash after durable quarantine")
     monkeypatch.setattr(hitl, "reset_needs_human", quarantine)
-    args = dict(worker_id=71, port=9999, job=job, reason="login_required",
+    args = dict(worker_id=71, port=9999, job=job, reason="screening_review",
                 instructions="review", navigate_url=job["application_url"], duration_ms=10)
     if crash:
         with pytest.raises(RuntimeError, match="durable quarantine"):
@@ -473,3 +473,24 @@ def test_claude_login_failure_is_retryable_and_stops_run(fake_run, monkeypatch):
     assert result == "failed:claude_auth"
     assert launcher._stop_event.is_set()
     assert not launcher._is_permanent_failure(result)
+
+
+def test_hitl_done_after_sign_in_relaunches_agent(tmp_db, seed_job, monkeypatch):
+    """A sign-in/verification block is before the form: Done relaunches instead of quarantining."""
+    from applypilot.apply import hitl, human_review
+    conn = tmp_db()
+    seed_job(conn)
+    job = launcher.acquire_job(max_age_days=0)
+    monkeypatch.setattr(hitl, "_start_hitl_listener", lambda w, event, h: (event.set(), 1234)[1])
+    for name in ("_inject_banner_for_worker", "notify_human_needed", "_stop_hitl_listener",
+                 "_register_waiting", "_unregister_waiting"):
+        monkeypatch.setattr(hitl, name, lambda *a, **kw: None)
+    monkeypatch.setattr(human_review, "_start_done_watcher", lambda *a: None)
+    monkeypatch.setattr(hitl, "_stdin_fallback_lock", Mock(acquire=Mock(return_value=False)))
+    agent = Mock(return_value=("applied", 5, []))
+    monkeypatch.setattr(launcher, "run_job", agent)
+    out = hitl._run_hitl(worker_id=72, port=9999, job=job, reason="email_verification",
+                         instructions="verify", navigate_url=job["application_url"], duration_ms=10)
+    assert out[0] == "applied"
+    agent.assert_called_once()
+    assert conn.execute("SELECT apply_status FROM jobs").fetchone()[0] == "in_progress"
