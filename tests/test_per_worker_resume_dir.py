@@ -8,6 +8,7 @@ After the fix: each worker writes to APPLY_WORKER_DIR/f'worker-{wid}/'.
 """
 from __future__ import annotations
 
+import pytest
 import json
 import sys
 from pathlib import Path
@@ -155,3 +156,26 @@ class TestPerWorkerResumeDir:
         # Verify the files are independent (rewriting one does not touch the other).
         w0.write_bytes(b"WORKER0_VERSION")
         assert w1.read_bytes() != b"WORKER0_VERSION"
+
+
+class TestDocFormatFallback:
+    def test_docx_request_falls_back_to_pdf(self, tmp_path, monkeypatch):
+        """PDF-only resume folders must still build a prompt when docx is the default."""
+        apply_worker_dir = _setup_paths(tmp_path, monkeypatch)
+        resume_txt = _make_resume(tmp_path, "pdf")
+        _mock_db_calls(monkeypatch)
+
+        from applypilot.apply.prompt import build_prompt
+        prompt = build_prompt(_build_job(resume_txt), tailored_resume="x", worker_id=0, doc_format="docx")
+        assert (apply_worker_dir / "worker-0" / "Test_User_Resume.pdf").exists()
+        assert "Resume PDF (upload this)" in prompt
+
+    def test_no_document_raises_prompt_build_error(self, tmp_path, monkeypatch):
+        _setup_paths(tmp_path, monkeypatch)
+        resume_txt = tmp_path / "only.txt"
+        resume_txt.write_text("x", encoding="utf-8")
+        _mock_db_calls(monkeypatch)
+
+        from applypilot.apply.prompt import PromptBuildError, build_prompt
+        with pytest.raises(PromptBuildError):
+            build_prompt(_build_job(resume_txt), tailored_resume="x", worker_id=0, doc_format="docx")
