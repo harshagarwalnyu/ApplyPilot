@@ -560,6 +560,8 @@ def _start_worker_listener(worker_id: int, no_hitl: bool = False) -> int:
                 "chromePid": state.get("chrome_pid"),
                 "lastFocused": state.get("last_focused", 0),
                 "noHitl": bool(state.get("no_hitl", False)),
+                "jobUrl": job.get("url", ""),
+                "hitlHash": state.get("hitl_job_hash"),
             })
 
         def _handle_log(self):

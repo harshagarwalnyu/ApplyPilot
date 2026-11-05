@@ -494,3 +494,63 @@ def test_hitl_done_after_sign_in_relaunches_agent(tmp_db, seed_job, monkeypatch)
     assert out[0] == "applied"
     agent.assert_called_once()
     assert conn.execute("SELECT apply_status FROM jobs").fetchone()[0] == "in_progress"
+
+
+def _quiet_hitl(monkeypatch, hitl, human_review, listener):
+    monkeypatch.setattr(hitl, "_start_hitl_listener", listener)
+    for name in ("_inject_banner_for_worker", "notify_human_needed", "_stop_hitl_listener",
+                 "_register_waiting", "_unregister_waiting"):
+        monkeypatch.setattr(hitl, name, lambda *a, **kw: None)
+    monkeypatch.setattr(human_review, "_start_done_watcher", lambda *a: None)
+    monkeypatch.setattr(hitl, "_stdin_fallback_lock", Mock(acquire=Mock(return_value=False)))
+
+
+def test_no_hitl_email_code_waits_and_passes_operator_code(tmp_db, seed_job, monkeypatch):
+    """Under --no-hitl an emailed-code pause still waits for the operator, whose note reaches the agent."""
+    from applypilot.apply import hitl, human_review
+    conn = tmp_db()
+    seed_job(conn)
+    job = launcher.acquire_job(max_age_days=0)
+    launcher._worker_state[73] = {}
+
+    def listener(w, event, h):
+        launcher._worker_state[73]["handback_instructions"] = "code 482913"
+        event.set()
+        return 1234
+    _quiet_hitl(monkeypatch, hitl, human_review, listener)
+    agent = Mock(return_value=("applied", 5, []))
+    monkeypatch.setattr(launcher, "run_job", agent)
+    out = hitl._run_hitl(worker_id=73, port=9999, job=job, reason="email_verification",
+                         instructions="verify", navigate_url=job["application_url"], duration_ms=10, no_hitl=True)
+    assert out[0] == "applied"
+    assert "code 482913" in agent.call_args.kwargs["extra_context"]
+    assert "handback_instructions" not in launcher._worker_state[73]
+
+
+def test_no_hitl_email_code_parks_after_timeout(tmp_db, seed_job, monkeypatch):
+    from applypilot.apply import hitl, human_review
+    conn = tmp_db()
+    seed_job(conn)
+    job = launcher.acquire_job(max_age_days=0)
+    _quiet_hitl(monkeypatch, hitl, human_review, lambda w, event, h: 1234)
+    monkeypatch.setattr(hitl, "OPERATOR_WAIT_S", -1)
+    agent = Mock()
+    monkeypatch.setattr(launcher, "run_job", agent)
+    out = hitl._run_hitl(worker_id=74, port=9999, job=job, reason="email_verification",
+                         instructions="verify", navigate_url=job["application_url"], duration_ms=10, no_hitl=True)
+    assert out is None
+    agent.assert_not_called()
+    assert conn.execute("SELECT apply_status FROM jobs").fetchone()[0] == "needs_human"
+
+
+def test_no_hitl_sign_in_still_parks_immediately(tmp_db, seed_job, monkeypatch):
+    from applypilot.apply import hitl, human_review
+    conn = tmp_db()
+    seed_job(conn)
+    job = launcher.acquire_job(max_age_days=0)
+    listener = Mock(return_value=1234)
+    _quiet_hitl(monkeypatch, hitl, human_review, listener)
+    out = hitl._run_hitl(worker_id=75, port=9999, job=job, reason="login_required",
+                         instructions="sign in", navigate_url=job["application_url"], duration_ms=10, no_hitl=True)
+    assert out is None
+    listener.assert_not_called()

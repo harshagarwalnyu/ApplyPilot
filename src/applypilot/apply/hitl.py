@@ -38,6 +38,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # Blocks that sit before the form: the human only signs in or completes an emailed
 # code/link, so on Done the agent is relaunched instead of quarantining the job.
 RESUMABLE_REASONS = frozenset({"login_required", "email_verification", "login_issue"})
+# Pauses the operator session clears from the inbox (it watches /api/status and POSTs the code
+# to /api/done). These wait even under --no-hitl, up to OPERATOR_WAIT_S, then park as usual.
+OPERATOR_REASONS = frozenset({"email_verification"})
+OPERATOR_WAIT_S = 20 * 60
 
 from applypilot import config
 from applypilot.apply.chrome import (
@@ -556,8 +560,9 @@ def _run_hitl(
     if _live_no_hitl is not None:
         no_hitl = bool(_live_no_hitl)
 
-    # 2. --no-hitl: park the job and bail.
-    if no_hitl:
+    # 2. --no-hitl: park the job and bail, except for operator-cleared pauses, which wait bounded.
+    deadline = time.monotonic() + OPERATOR_WAIT_S if no_hitl and reason in OPERATOR_REASONS else None
+    if no_hitl and deadline is None:
         if add_event:
             add_event(f"[W{worker_id}] --no-hitl: parking '{reason}' and moving on")
         if update_state:
@@ -627,8 +632,12 @@ def _run_hitl(
         threading.Thread(target=_stdin_done_reader, daemon=True).start()
 
     # 8. Wait, with Chrome-crash recovery.
+    timed_out = False
     while stop_event is None or not stop_event.is_set():
         if hitl_event.wait(timeout=5.0):
+            break
+        if deadline is not None and time.monotonic() > deadline:
+            timed_out = True
             break
         if chrome_proc and chrome_proc.poll() is not None:
             if add_event:
@@ -644,6 +653,18 @@ def _run_hitl(
                 logger.debug("Chrome relaunch during HITL failed", exc_info=True)
     _stop_hitl_listener(worker_id)
     _unregister_waiting(worker_id)
+    with launcher._worker_state_lock:
+        _ws = launcher._worker_state.get(worker_id) or {}
+        operator_note = (_ws.pop("handback_instructions", None) or "").strip()
+        _ws.pop("hitl_event", None)
+        _ws.pop("hitl_job_hash", None)
+    if timed_out:
+        # Nobody cleared it in time: leave it parked as needs_human, exactly like --no-hitl.
+        if add_event:
+            add_event(f"[W{worker_id}] no operator after {OPERATOR_WAIT_S // 60} min: parking '{reason}'")
+        if update_state:
+            update_state(worker_id, status="applying", last_action=f"parked: {reason[:25]}")
+        return None
     if reason in RESUMABLE_REASONS and not (stop_event is not None and stop_event.is_set()):
         # The block was before the form (sign-in / emailed code or link): the human only
         # got past it, so nothing can have been submitted. Send the agent back in.
@@ -654,9 +675,13 @@ def _run_hitl(
         _db_retry_commit(conn)
         if add_event:
             add_event(f"[W{worker_id}] Resuming after {reason}")
+        context = (f"The operator has resolved '{reason}' (signed in or completed the "
+                   "emailed verification/reset). Continue the application from where it is.")
+        if operator_note:
+            context += ("\nOPERATOR NOTE (from the inbox; enter any code into the waiting field, or "
+                        "browser_navigate to any link, then continue): " + operator_note)
         return run_job(job, port=port, worker_id=worker_id, model=model, dry_run=dry_run,
-                       extra_context=f"The operator has resolved '{reason}' (signed in or completed the "
-                                     "emailed verification/reset). Continue the application from where it is.")
+                       extra_context=context)
     # Done means the human may have submitted. Keep the row protected and
     # require reconciliation instead of launching another submitting agent.
     reset_needs_human(job["url"])
