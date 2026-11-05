@@ -6,6 +6,7 @@ result, and updates the database. Supports parallel workers via --workers.
 """
 
 import atexit
+import csv
 import json
 import logging
 import os
@@ -702,7 +703,7 @@ def _start_worker_listener(worker_id: int, no_hitl: bool = False) -> int:
                     FROM jobs
                     WHERE fit_score IS NOT NULL AND fit_score >= 6
                       AND (apply_status IS NULL
-                           OR apply_status NOT IN ('applied', 'manual', 'in_progress'))
+                           OR apply_status IN ('failed', 'dry_run'))
                       AND (eligibility IS NULL OR eligibility = 'eligible')
                     ORDER BY fit_score DESC, discovered_at DESC
                     LIMIT ?
@@ -772,26 +773,50 @@ def _start_worker_listener(worker_id: int, no_hitl: bool = False) -> int:
                 conn = get_connection()
                 now = datetime.now(tz.utc).isoformat()
                 if action == "applied":
-                    conn.execute("""UPDATE jobs SET apply_status='applied', applied_at=?,
+                    cursor = conn.execute("""UPDATE jobs SET apply_status='applied', applied_at=?,
                         apply_category='applied', apply_attempts=COALESCE(apply_attempts,0)+1
-                        WHERE url=?""", (now, url))
+                        WHERE url=? AND (apply_status IS NULL OR apply_status IN ('failed', 'dry_run'))""", (now, url))
+                    if cursor.rowcount != 1:
+                        conn.rollback()
+                        self.send_response(409)
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        return
                     transition_state(conn, url, "applied",
                         reason="HTTP handler mark", force=True)
                 elif action == "skip":
-                    conn.execute("""UPDATE jobs SET apply_status='failed',
+                    cursor = conn.execute("""UPDATE jobs SET apply_status='failed',
                         apply_category='archived_ineligible',
-                        apply_error='manually skipped', apply_attempts=99 WHERE url=?""", (url,))
+                        apply_error='manually skipped', apply_attempts=99 WHERE url=? AND (apply_status IS NULL OR apply_status IN ('failed', 'dry_run'))""", (url,))
+                    if cursor.rowcount != 1:
+                        conn.rollback()
+                        self.send_response(409)
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        return
                     transition_state(conn, url, "manual_only",
                         reason="HTTP handler skip", force=True)
                 elif action == "error":
-                    conn.execute("""UPDATE jobs SET apply_status='failed',
+                    cursor = conn.execute("""UPDATE jobs SET apply_status='failed',
                         apply_category='archived_platform',
-                        apply_error='manually marked error', apply_attempts=99 WHERE url=?""", (url,))
+                        apply_error='manually marked error', apply_attempts=99 WHERE url=? AND (apply_status IS NULL OR apply_status IN ('failed', 'dry_run'))""", (url,))
+                    if cursor.rowcount != 1:
+                        conn.rollback()
+                        self.send_response(409)
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        return
                     transition_state(conn, url, "apply_failed",
                         reason="HTTP handler error", force=True)
                 elif action == "reset":
-                    conn.execute("""UPDATE jobs SET apply_status=NULL, apply_category='pending',
-                        apply_error=NULL, apply_attempts=0, agent_id=NULL WHERE url=?""", (url,))
+                    cursor = conn.execute("""UPDATE jobs SET apply_status=NULL, apply_category='pending',
+                        apply_error=NULL, apply_attempts=0, agent_id=NULL WHERE url=? AND (apply_status IS NULL OR apply_status IN ('failed', 'dry_run'))""", (url,))
+                    if cursor.rowcount != 1:
+                        conn.rollback()
+                        self.send_response(409)
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        return
                     transition_state(conn, url, "ready_to_apply",
                         reason="HTTP handler reset", force=True)
                 commit_with_retry(conn)
@@ -1428,6 +1453,97 @@ def _db_retry_commit(conn: "sqlite3.Connection", timeout: float = 300.0) -> None
             delay = min(delay * 1.5, 30.0)
 
 
+_roster_cache = None
+_roster_lock = threading.Lock()
+
+
+def _load_exclusion_roster():
+    """Read a fresh shared roster before opening the SQLite write transaction."""
+    global _roster_cache
+    path = os.environ.get("APPLYPILOT_EXCLUDE_CSV")
+    if not path:
+        return set(), set()
+    with _roster_lock:
+        stat = Path(path).stat()
+        if not os.access(path, os.R_OK):
+            raise PermissionError("exclusion roster is unreadable")
+        if time.time() - stat.st_mtime > 24 * 60 * 60:
+            raise ValueError("exclusion roster is older than 24 hours")
+        key = (path, stat.st_mtime_ns, stat.st_size)
+        if _roster_cache is not None and _roster_cache[0] == key:
+            return _roster_cache[1]
+        urls, roles = set(), set()
+        with open(path, newline="", encoding="utf-8-sig") as source:
+            reader = csv.DictReader(source)
+            if not {"url", "company", "title"}.issubset(reader.fieldnames or []):
+                raise ValueError("exclusion roster requires url,company,title headers")
+            for row in reader:
+                url = _roster_url(row.get("url") or "")
+                company, title = (_roster_text(row.get(k) or "") for k in ("company", "title"))
+                if url:
+                    urls.add(url)
+                if company and title:
+                    roles.add((company, title))
+        _roster_cache = (key, (urls, roles))
+        return _roster_cache[1]
+
+
+def _roster_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+# Query params that name the posting. Everything else (utm_*, source, ref, ...) is dropped.
+# An ID param missing here only makes the roster over-exclude (safe), never miss a duplicate.
+_POSTING_ID_PARAMS = {"gh_jid", "jid", "jobid", "job_id", "job", "id", "pid", "postingid",
+                      "reqid", "req_id", "requisitionid", "jobreqid", "jobpostingid", "positionid"}
+
+
+def _roster_url(url: str) -> str:
+    """Compare key for the exclusion roster: no fragment, only posting-ID query params.
+
+    Query params that identify the posting stay (gh_jid, jobId, ...): many career sites
+    serve every job from one path, and dropping the query made them all collide.
+    """
+    from urllib.parse import parse_qsl, urlencode, urlsplit
+
+    parts = urlsplit(url.strip().lower())
+    query = sorted((k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                   if k in _POSTING_ID_PARAMS)
+    base = f"{parts.scheme}://{parts.netloc}{parts.path}".rstrip("/") if parts.netloc else parts.path.rstrip("/")
+    return f"{base}?{urlencode(query)}" if query else base
+
+
+def _worker_may_be_alive(pid, host) -> bool:
+    """Check the owning process, conservatively preserving unknown remote owners."""
+    import socket
+    if not pid:
+        return False  # Legacy locks have no durable owner; quarantine only.
+    if host != socket.gethostname():
+        return True
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, int(pid))
+        if not handle:
+            return ctypes.get_last_error() != 87  # access denied is not death
+        try:
+            code = wintypes.DWORD()
+            return not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == 259
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def acquire_job(target_url: str | None = None,
                 min_score: int | None = None,
                 max_score: int | None = None,
@@ -1451,7 +1567,28 @@ def acquire_job(target_url: str | None = None,
     if max_age_days is None:
         max_age_days = _cfg.DEFAULTS["max_job_age_days"]
 
+    try:
+        roster_urls, roster_roles = _load_exclusion_roster()
+    except (OSError, ValueError, csv.Error):
+        logger.error("Cannot acquire job: exclusion roster unavailable", exc_info=True)
+        return None
+
     conn = get_connection()
+
+    def excluded(row):
+        job = dict(row)
+        match = (any(_roster_url(job.get(k) or "") in roster_urls
+                     for k in ("url", "application_url"))
+                 or (_roster_text(job.get("company") or ""),
+                     _roster_text(job.get("title") or "")) in roster_roles)
+        if match:
+            conn.execute("UPDATE jobs SET apply_status='excluded_roster', "
+                         "apply_category='excluded_roster', apply_error='shared roster' WHERE url=?",
+                         (job["url"],))
+            transition_state(conn, job["url"], "archived", reason="shared roster exclusion", force=True)
+            logger.info("Skipping shared roster job: %s", job["url"])
+        return match
+
     try:
         _begin_deadline = time.monotonic() + 300
         _begin_delay = 2.0
@@ -1468,29 +1605,24 @@ def acquire_job(target_url: str | None = None,
                 time.sleep(_begin_delay)
                 _begin_delay = min(_begin_delay * 1.5, 30.0)
 
-        # Release stale in_progress locks from crashed runs (>30 min old).
-        # P0.5 leak (c) from decision #31: also revert canonical state from
-        # 'applying' back to 'ready_to_apply' for each affected job. Pull
-        # affected URLs first so we can emit per-row transitions after the
-        # bulk UPDATE.
-        stale_urls = [
-            r[0] for r in conn.execute("""
-                SELECT url FROM jobs
-                WHERE apply_status = 'in_progress'
-                  AND last_attempted_at IS NOT NULL
-                  AND last_attempted_at < datetime('now', '-30 minutes')
-            """).fetchall()
-        ]
-        conn.execute("""
-            UPDATE jobs SET apply_status = NULL, agent_id = NULL
-            WHERE apply_status = 'in_progress'
-              AND last_attempted_at IS NOT NULL
-              AND last_attempted_at < datetime('now', '-30 minutes')
-        """)
+        # Quarantine stale locks: a crashed run may already have submitted.
+        # Pull URLs first so canonical state and audit history agree.
+        stale_urls = []
+        for stale in conn.execute("""
+            SELECT url, worker_pid, worker_host FROM jobs
+            WHERE apply_status='in_progress' AND last_attempted_at IS NOT NULL
+              AND datetime(last_attempted_at) < datetime('now', '-30 minutes')
+        """).fetchall():
+            if _worker_may_be_alive(stale["worker_pid"], stale["worker_host"]):
+                continue
+            conn.execute("UPDATE jobs SET apply_status='unconfirmed', "
+                         "apply_category='unconfirmed', agent_id=NULL, lease_token=NULL "
+                         "WHERE url=? AND apply_status='in_progress'", (stale["url"],))
+            stale_urls.append(stale["url"])
         for stale_url in stale_urls:
             try:
                 transition_state(
-                    conn, stale_url, "ready_to_apply",
+                    conn, stale_url, "unconfirmed",
                     reason="stale-lock release (acquire_job)",
                     force=True,
                 )
@@ -1501,16 +1633,30 @@ def acquire_job(target_url: str | None = None,
             like = f"%{target_url.split('?')[0].rstrip('/')}%"
             row = conn.execute("""
                 SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path, company
+                       fit_score, location, full_description, cover_letter_path, company, apply_status
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
                   AND tailored_resume_path IS NOT NULL
-                  AND (apply_status IS NULL OR apply_status != 'in_progress')
                 ORDER BY
                     CASE WHEN url = ? OR application_url = ? THEN 0 ELSE 1 END
                 LIMIT 1
             """, (target_url, target_url, like, like,
                   target_url, target_url)).fetchone()
+            if row and row["apply_status"] in ("applied", "unconfirmed", "in_progress", "needs_human", "excluded_roster"):
+                logger.warning("Refusing --url job with apply_status=%s: %s", row["apply_status"], row["url"])
+                row = None
+            if row and row["application_url"]:
+                duplicate = conn.execute(
+                    "SELECT apply_status FROM jobs WHERE application_url=? AND url!=? "
+                    "AND apply_status IN ('applied', 'unconfirmed', 'in_progress', 'needs_human') LIMIT 1",
+                    (row["application_url"], row["url"]),
+                ).fetchone()
+                if duplicate:
+                    logger.warning("Refusing --url duplicate application with apply_status=%s: %s",
+                                   duplicate["apply_status"], row["url"])
+                    row = None
+            if row and excluded(row):
+                row = None
         else:
             blocked_sites, blocked_patterns = _load_blocked()
             site_filter = " AND ".join(f"site != '{s}'" for s in blocked_sites) if blocked_sites else "1=1"
@@ -1555,11 +1701,11 @@ def acquire_job(target_url: str | None = None,
             # eligible to fire after the first applies. Skip any candidate
             # whose application_url matches another row that's already in
             # flight (applied, in_progress, or needs_human).
-            candidates = conn.execute(f"""
+            candidate_sql = f"""
                 SELECT j.url, j.title, j.site, j.application_url,
                        j.tailored_resume_path, j.fit_score, j.location,
                        j.full_description, j.cover_letter_path, j.company,
-                       j.strategy
+                       j.strategy, COALESCE(j.discovered_at, '') AS discovered_at
                 FROM jobs j
                 WHERE j.tailored_resume_path IS NOT NULL
                   AND (j.apply_status IS NULL OR j.apply_status = 'failed')
@@ -1579,11 +1725,27 @@ def acquire_job(target_url: str | None = None,
                         AND j2.application_url IS NOT NULL
                         AND j2.application_url != ''
                         AND j2.url != j.url
-                        AND j2.apply_status IN ('applied', 'in_progress', 'needs_human')
+                        AND j2.apply_status IN ('applied', 'unconfirmed', 'in_progress', 'needs_human')
                   )
-                ORDER BY j.fit_score DESC, j.discovered_at DESC, j.url
+                {{page_filter}}
+                ORDER BY j.fit_score DESC, COALESCE(j.discovered_at, '') DESC, j.url
                 LIMIT 100
-            """, (min_score, *company_excl_params, *age_params)).fetchall()
+            """
+
+            def fetch_page(after=None):
+                page_filter = ""
+                params = [min_score, *company_excl_params, *age_params]
+                if after is not None:
+                    page_filter = (
+                        "AND (j.fit_score < ? OR (j.fit_score = ? AND "
+                        "(COALESCE(j.discovered_at, '') < ? OR "
+                        "(COALESCE(j.discovered_at, '') = ? AND j.url > ?))))"
+                    )
+                    params.extend([after["fit_score"], after["fit_score"],
+                                   after["discovered_at"], after["discovered_at"], after["url"]])
+                return conn.execute(candidate_sql.format(page_filter=page_filter), params).fetchall()
+
+            candidates = fetch_page()
 
             # Build in-flight buckets once, reuse for every candidate.
             # Use resolve_company_key so Greenhouse/Workday jobs (NULL company,
@@ -1623,33 +1785,25 @@ def acquire_job(target_url: str | None = None,
             #
             # Stable sort preserves SQL ordering for ties — Python's
             # sorted() is guaranteed stable since 2.3.
-            candidates = sorted(
-                candidates,
-                key=lambda c: (
-                    _in_flight_count(resolve_company_key(dict(c))),
-                    -(c["fit_score"] or 0),
-                ),
-            )
-
-            # Pick first candidate whose company is under cap AND ATS lane is free.
             row = None
-            for cand in candidates:
-                if over_cap(dict(cand)):
-                    continue
-                ats = detect_ats(cand["application_url"] or cand["url"] or "")
-                if ats is not None and ats in active_ats:
-                    continue
-                row = cand
-                break
-
-            if row is None and candidates:
-                logger.debug(
-                    "acquire_job: all %d candidates blocked (ATS lanes=%s, cap-blocked companies present)",
-                    len(candidates), active_ats,
-                )
+            while candidates:
+                # Advance using SQL order, before the page-local fairness sort.
+                after = candidates[-1]
+                for cand in sorted(candidates, key=lambda c: (
+                        _in_flight_count(resolve_company_key(dict(c))), -(c["fit_score"] or 0))):
+                    if excluded(cand) or over_cap(dict(cand)):
+                        continue
+                    ats = detect_ats(cand["application_url"] or cand["url"] or "")
+                    if ats is not None and ats in active_ats:
+                        continue
+                    row = cand
+                    break
+                if row is not None or len(candidates) < 100:
+                    break
+                candidates = fetch_page(after)
 
         if not row:
-            conn.rollback()
+            commit_with_retry(conn)
             return None
 
         from applypilot.config import is_manual_ats
@@ -1692,13 +1846,16 @@ def acquire_job(target_url: str | None = None,
             logger.info("Skipping manual ATS: %s", row["url"][:80])
             return None
 
+        import socket
+        import uuid
+        lease_token = uuid.uuid4().hex
         now = datetime.now(timezone.utc).isoformat()
         conn.execute("""
             UPDATE jobs SET apply_status = 'in_progress',
-                           agent_id = ?,
+                           agent_id = ?, worker_pid = ?, worker_host = ?, lease_token = ?,
                            last_attempted_at = ?
             WHERE url = ?
-        """, (f"worker-{worker_id}", now, row["url"]))
+        """, (f"worker-{worker_id}", os.getpid(), socket.gethostname(), lease_token, now, row["url"]))
 
         # Emit state transition: ready_to_apply → applying (force=True since
         # the in-flight job may currently be at apply_failed from a prior run).
@@ -1709,7 +1866,7 @@ def acquire_job(target_url: str | None = None,
 
         commit_with_retry(conn)
 
-        return dict(row)
+        return {**dict(row), "lease_token": lease_token}
     except Exception:
         conn.rollback()
         raise
@@ -1717,9 +1874,18 @@ def acquire_job(target_url: str | None = None,
 
 def mark_result(url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
-                task_id: str | None = None) -> None:
+                task_id: str | None = None, lease_token: str | None = None) -> None:
     """Update a job's apply status in the database + emit state transition."""
     conn = get_connection()
+    conn.execute("BEGIN IMMEDIATE")
+    current = conn.execute("SELECT apply_status,lease_token FROM jobs WHERE url=?", (url,)).fetchone()
+    if (not current or current["apply_status"] not in (None, "in_progress", "needs_human")
+            or current["lease_token"] != lease_token):
+        conn.rollback()
+        logger.warning("Ignoring fenced result for %s", url)
+        return
+    if current["apply_status"] == "needs_human" and status != "applied":
+        status = "unconfirmed"
     now = datetime.now(timezone.utc).isoformat()
     if status == "applied":
         _db_retry_execute(conn, """
@@ -1747,6 +1913,8 @@ def mark_result(url: str, status: str, error: str | None = None,
         # Map the legacy apply_status value to a state-machine state.
         to_state = {
             "failed":       "apply_failed",
+            "unconfirmed":  "unconfirmed",
+            "dry_run":      "ready_to_apply",
             "manual":       "manual_only",
             "needs_human":  "needs_human",
         }.get(status, "apply_failed")
@@ -1759,13 +1927,23 @@ def mark_result(url: str, status: str, error: str | None = None,
     _db_retry_commit(conn)
 
 
-def release_lock(url: str) -> None:
-    """Release the in_progress lock and revert state from applying back to ready_to_apply."""
+def release_lock(url: str, *, agent_started: bool = True, lease_token: str | None = None) -> None:
+    """Quarantine interrupted runs; only prompt generation can safely requeue."""
+    if agent_started:
+        conn = get_connection()
+        row = conn.execute("SELECT apply_status FROM jobs WHERE url=?", (url,)).fetchone()
+        if row and row[0] == "in_progress":
+            mark_result(url, "unconfirmed", "lock released after agent start", lease_token=lease_token)
+        return
     conn = get_connection()
-    _db_retry_execute(conn,
-        "UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url = ? AND apply_status = 'in_progress'",
-        (url,),
+    cursor = _db_retry_execute(conn,
+        "UPDATE jobs SET apply_status = NULL, agent_id = NULL, lease_token=NULL "
+        "WHERE url = ? AND apply_status = 'in_progress' AND lease_token IS ?",
+        (url, lease_token),
     )
+    if cursor.rowcount != 1:
+        conn.rollback()
+        return
     transition_state(conn, url, "ready_to_apply",
                      reason="lock released without submit",
                      force=True)
@@ -1801,7 +1979,7 @@ def gen_prompt(target_url: str, min_score: int | None = None, max_score: int | N
     prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text, worker_id=worker_id, doc_format=_doc_format)
 
     # Release the lock so the job stays available
-    release_lock(job["url"])
+    release_lock(job["url"], agent_started=False, lease_token=job.get("lease_token"))
 
     # Write prompt file
     config.ensure_dirs()
@@ -1828,22 +2006,26 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     if status == "applied":
-        _db_retry_execute(conn, """
+        cursor = _db_retry_execute(conn, """
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
                            apply_error = NULL, agent_id = NULL,
                            apply_category = 'applied'
-            WHERE url = ?
+            WHERE url = ? AND (apply_status IS NULL OR apply_status IN ('failed', 'dry_run', 'manual'))
         """, (now, url))
     else:
         error = reason or "manual"
         category = categorize_apply_result("failed", error)
-        _db_retry_execute(conn, """
+        cursor = _db_retry_execute(conn, """
             UPDATE jobs SET apply_status = 'failed', apply_error = ?,
                            apply_attempts = 99, agent_id = NULL,
                            apply_category = ?
-            WHERE url = ?
+            WHERE url = ? AND (apply_status IS NULL OR apply_status IN ('failed', 'dry_run', 'manual'))
         """, (error, category, url))
     
+    if cursor.rowcount != 1:
+        conn.rollback()
+        raise ValueError("Protected job requires explicit reconciliation")
+
     state_map = {
         "applied":      "applied",
         "failed":       "apply_failed",
@@ -1874,7 +2056,7 @@ def reset_failed() -> int:
             WHERE apply_status = 'failed'
               OR (apply_status IS NOT NULL AND apply_status != 'applied'
                   AND apply_status != 'in_progress'
-                  AND apply_status != 'needs_human')
+                  AND apply_status NOT IN ('needs_human', 'unconfirmed', 'excluded_roster'))
         """).fetchall()
     ]
     cursor = _db_retry_execute(conn, """
@@ -1884,7 +2066,7 @@ def reset_failed() -> int:
         WHERE apply_status = 'failed'
           OR (apply_status IS NOT NULL AND apply_status != 'applied'
               AND apply_status != 'in_progress'
-              AND apply_status != 'needs_human')
+              AND apply_status NOT IN ('needs_human', 'unconfirmed', 'excluded_roster'))
     """)
     
     for u in urls_to_reset:
@@ -1998,10 +2180,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     if dry_run:
         try:
             from applypilot.apply.chrome import inject_dry_run_gate
-            inject_dry_run_gate(port)
+            if not inject_dry_run_gate(port):
+                raise RuntimeError("submit blocker was not verified")
         except Exception:
-            logger.debug("dry_run gate injection failed; falling back to prompt-only",
-                         exc_info=True)
+            logger.error("dry-run setup error: submit blocker unavailable", exc_info=True)
+            return "failed:dry_run_setup_error", 0, []
 
     # Wipe stale resume / cover-letter / MCP-config copies from the previous
     # job BEFORE build_prompt writes the fresh files. Earlier this wipe sat
@@ -2036,7 +2219,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             "FORBIDDEN: browser_navigate — do NOT navigate to any URL. Do NOT load the job URL.\n"
             "SKIP steps 1, 1a, 3, and 4 in STEP-BY-STEP entirely.\n"
             "After the snapshot: check for a login wall (step 5), then continue filling remaining form\n"
-            "fields from the current page state and submit.\n"
+            "fields from the current page state. If already submitted, output RESULT:ALREADY_APPLIED. "
+            "Never click Submit/Apply a second time.\n"
             "== END RESUME ==\n\n"
         )
         if extra_context:
@@ -2276,8 +2460,20 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         if tev and tev.is_set():
             return "takeover", int((time.time() - start) * 1000), []
 
-        if returncode and returncode < 0:
-            return "skipped", int((time.time() - start) * 1000), []
+        # The claude CLI could not log in: no tool ran, so nothing was submitted. Every
+        # later job would fail the same way, so stop the run and keep this job retryable.
+        raw = "\n".join(text_parts)
+        if not tool_calls and ("Failed to authenticate" in raw or "Invalid API key" in raw
+                               or "Please run /login" in raw):
+            add_event(f"[W{worker_id}] CLAUDE LOGIN FAILED. Run `claude` and /login, then restart.")
+            update_state(worker_id, status="failed", last_action="claude login failed")
+            logger.error("Claude Code CLI is not logged in (%s). Stopping all workers.",
+                         raw.strip().splitlines()[-1][:120] if raw.strip() else "no output")
+            _stop_event.set()
+            return "failed:claude_auth", int((time.time() - start) * 1000), []
+
+        if returncode:
+            return "unconfirmed", int((time.time() - start) * 1000), []
 
         output = "\n".join(text_parts)
         elapsed = int(time.time() - start)
@@ -2300,7 +2496,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                          last_action="NO CREDITS")
             logger.error("Claude Code credits exhausted. Cannot auto-apply. "
                          "Top up at https://console.anthropic.com/settings/billing")
-            return "failed:credits_exhausted", duration_ms, []
+            return "unconfirmed", duration_ms, []
 
         # Parse ACCOUNT_CREATED lines and save to DB
         _parse_account_created(output, job.get("url"))
@@ -2313,10 +2509,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         def _clean_reason(s: str) -> str:
             return re.sub(r'[*`"]+$', '', s).strip()
 
-        for result_status in ["APPLIED", "ALREADY_APPLIED", "SUCCESS", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"]:
+        for result_status in ["UNCONFIRMED", "APPLIED", "ALREADY_APPLIED", "SUCCESS", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"]:
             if f"RESULT:{result_status}" in output:
                 # Normalize SUCCESS/ALREADY_APPLIED -> applied (already applied counts as applied)
                 canonical = "applied" if result_status in ("SUCCESS", "ALREADY_APPLIED") else result_status.lower()
+                if dry_run and canonical == "applied" and result_status != "ALREADY_APPLIED":
+                    canonical = "dry_run"
                 # Mark Q&A outcomes based on application result
                 if canonical == "applied" and job_url:
                     from applypilot.database import mark_qa_outcome
@@ -2382,8 +2580,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
                     update_state(worker_id, status="failed",
                                  last_action=f"FAILED: {reason[:25]}")
+                    pre_submit = ("expired", "login_required", "not_eligible_location",
+                                  "not_eligible_salary", "not_a_job_application",
+                                  "dry_run_setup_error", "contract_only")
+                    if reason not in pre_submit and reason not in HITL_AUTO_ROUTE:
+                        return "unconfirmed", duration_ms, screening_qs
                     return f"failed:{reason}", duration_ms, screening_qs
-            return "failed:unknown", duration_ms, screening_qs
+            return "unconfirmed", duration_ms, screening_qs
 
         # No explicit RESULT line. Try to infer the outcome from agent output.
         inferred = _infer_result_from_output(output)
@@ -2398,28 +2601,28 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 save_path(job_ats, tool_calls,
                           job_url=job.get("application_url") or job_url,
                           duration_ms=duration_ms)
-            return "applied", duration_ms, screening_qs
+            return "applied" if inferred == "already_applied" else "unconfirmed", duration_ms, screening_qs
         if inferred:
             add_event(f"[W{worker_id}] INFERRED {inferred.upper()} ({elapsed}s): {(job.get('title') or '')[:30]}")
             update_state(worker_id, status="failed",
                          last_action=f"inferred:{inferred[:25]}")
-            return f"failed:{inferred}", duration_ms, screening_qs
+            return "unconfirmed", duration_ms, screening_qs
 
         add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
         update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
-        return "failed:no_result_line", duration_ms, screening_qs
+        return "unconfirmed", duration_ms, screening_qs
 
     except subprocess.TimeoutExpired:
         duration_ms = int((time.time() - start) * 1000)
         elapsed = int(time.time() - start)
         add_event(f"[W{worker_id}] TIMEOUT ({elapsed}s)")
         update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
-        return "failed:timeout", duration_ms, []
+        return "unconfirmed", duration_ms, []
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)
         add_event(f"[W{worker_id}] ERROR: {str(e)[:40]}")
         update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
-        return f"failed:{str(e)[:100]}", duration_ms, []
+        return "unconfirmed", duration_ms, []
     finally:
         with _claude_lock:
             _claude_procs.pop(worker_id, None)

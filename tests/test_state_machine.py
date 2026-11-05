@@ -169,3 +169,18 @@ def test_backfill_is_idempotent(tmp_db, seed_job):
     assert sum(first.values()) == 1
     second = backfill_states(conn)
     assert second == {}  # nothing more to do
+
+
+def test_unconfirmed_cannot_reenter_applying(tmp_db, seed_job):
+    conn = tmp_db()
+    job = seed_job(conn, state="applying")
+    assert transition_state(conn, job["url"], "unconfirmed")
+    assert not transition_state(conn, job["url"], "applying")
+    assert not transition_state(conn, job["url"], "ready_to_apply")
+
+
+def test_backfill_unconfirmed(tmp_db, seed_job):
+    conn = tmp_db()
+    job = seed_job(conn, apply_status="unconfirmed")
+    backfill_states(conn)
+    assert current_state(conn, job["url"]) == "unconfirmed"

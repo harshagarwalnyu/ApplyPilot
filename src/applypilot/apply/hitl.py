@@ -121,7 +121,7 @@ _HITL_INSTRUCTIONS: dict[str, str] = {
     ),
     "stuck": (
         "FORM STUCK. The agent got stuck on a form element. Review the form, "
-        "fix any issues or stuck fields, and submit if possible. "
+        "fix any issues or stuck fields, and submit only if never submitted before. "
         "Click Done when done (even if you only unstuck it for the agent to retry)."
     ),
     "email_verification": (
@@ -136,12 +136,12 @@ _HITL_INSTRUCTIONS: dict[str, str] = {
     "form_stuck": (
         "COMPLETE THE APPLICATION FORM. The agent filled what it could but got stuck "
         "on a form element (usually a custom dropdown or validation error). "
-        "Review the form, fix missing fields, and submit. "
+        "Review the form, fix missing fields, and submit only if never submitted before. "
         "Click Done when the application is submitted."
     ),
     "screening_questions": (
         "ANSWER SCREENING QUESTIONS. The agent reached screening questions it wasn't "
-        "confident answering from your profile. Review and answer them, then submit. "
+        "confident answering from your profile. Review and answer them, then submit only if never submitted before. "
         "Click Done when finished."
     ),
     "security_concern": (
@@ -323,10 +323,17 @@ def _inject_banner_for_worker(worker_id: int, cdp_port: int, job: dict,
 # ---------------------------------------------------------------------------
 
 def mark_needs_human(url: str, reason: str, stuck_url: str,
-                     instructions: str, duration_ms: int | None = None) -> None:
+                     instructions: str, duration_ms: int | None = None,
+                     lease_token: str | None = None) -> bool:
     """Park a job for human review instead of marking it as failed."""
     from applypilot.apply.launcher import _db_retry_execute, _db_retry_commit
     conn = get_connection()
+    conn.execute("BEGIN IMMEDIATE")
+    current = conn.execute("SELECT apply_status,lease_token FROM jobs WHERE url=?", (url,)).fetchone()
+    if (not current or current["apply_status"] not in (None, "in_progress")
+            or current["lease_token"] != lease_token):
+        conn.rollback()
+        return False
     now = datetime.now(timezone.utc).isoformat()
     _db_retry_execute(conn, """
         UPDATE jobs SET apply_status = 'needs_human',
@@ -346,56 +353,30 @@ def mark_needs_human(url: str, reason: str, stuck_url: str,
                   "instructions": instructions[:200] if instructions else None},
         force=True)
     _db_retry_commit(conn)
+    return True
 
 
 def reset_needs_human(url: str | None = None) -> int:
-    """Reset parked jobs (needs_human) back to NULL so they can be retried.
-
-    Args:
-        url: Reset a specific job URL. If None, resets all parked jobs.
-
-    Returns:
-        Number of jobs reset.
-    """
-    from applypilot.apply.launcher import _db_retry_execute, _db_retry_commit
+    """Quarantine human reviews until submission evidence is reconciled."""
+    from applypilot.apply.launcher import _db_retry_commit
     conn = get_connection()
-
-    if url:
-        cursor = _db_retry_execute(conn, """
-            UPDATE jobs SET apply_status = NULL,
-                           needs_human_reason = NULL,
-                           needs_human_url = NULL,
-                           needs_human_instructions = NULL,
-                           agent_id = NULL,
-                           apply_category = NULL
-            WHERE url = ? AND apply_status = 'needs_human'
-        """, (url,))
-        if cursor.rowcount:
-            transition_state(conn, url, "applying",
-                reason="needs_human resolved, re-acquired",
-                force=True)
-    else:
-        # Fetch URLs before updating so we can emit individual transitions.
-        urls_to_reset = [
-            r[0] for r in conn.execute(
-                "SELECT url FROM jobs WHERE apply_status = 'needs_human'"
-            ).fetchall()
-        ]
-        cursor = _db_retry_execute(conn, """
-            UPDATE jobs SET apply_status = NULL,
-                           needs_human_reason = NULL,
-                           needs_human_url = NULL,
-                           needs_human_instructions = NULL,
-                           agent_id = NULL,
-                           apply_category = NULL
-            WHERE apply_status = 'needs_human'
-        """)
-        for u in urls_to_reset:
-            transition_state(conn, u, "applying",
-                reason="needs_human resolved, re-acquired",
-                force=True)
-    _db_retry_commit(conn)
-    return cursor.rowcount
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        rows = conn.execute(
+            "SELECT url FROM jobs WHERE apply_status='needs_human'"
+            + (" AND url=?" if url else ""), (url,) if url else (),
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                "UPDATE jobs SET apply_status='unconfirmed', apply_category='unconfirmed', "
+                "agent_id=NULL WHERE url=? AND apply_status='needs_human'", (row[0],))
+            transition_state(conn, row[0], "unconfirmed",
+                             reason="human review requires reconciliation", force=True)
+        _db_retry_commit(conn)
+        return len(rows)
+    except Exception:
+        conn.rollback()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +517,7 @@ def _run_hitl(
     update_state=None,
     stop_event=None,
 ) -> tuple[str, int, list[dict]] | None:
-    """Block on a needs_human pause; return the post-resume run_job result.
+    """Block on human review, then quarantine until explicit reconciliation.
 
     Replaces the two near-duplicate HITL paths in _worker_loop_body
     (generic + login_required). Steps:
@@ -549,16 +530,16 @@ def _run_hitl(
       6. notify_human_needed (desktop notification).
       7. Update worker state to "waiting_human".
       8. Wait on hitl_event with chrome-crash recovery.
-      9. reset_needs_human(...) — DB row back to its pre-pause state.
-      10. Re-launch agent on same Chrome, retry up to 3× on transient errors.
+      9. reset_needs_human(...) — quarantine the possible human submission.
 
-    Returns (result, duration_ms, screening_qs) from the post-resume run_job,
-    or None if no_hitl or stop was signaled.
+    Returns an unconfirmed result, or None if no_hitl or stop was signaled.
     """
     import hashlib
 
     # 1. Persist the needs_human row.
-    mark_needs_human(job["url"], reason, navigate_url, instructions, duration_ms)
+    if not mark_needs_human(job["url"], reason, navigate_url, instructions, duration_ms,
+                            lease_token=job.get("lease_token")):
+        return "unconfirmed", duration_ms or 0, []
 
     # The popup's "no-hitl" toggle mutates worker_state["no_hitl"] live;
     # honor that in preference to the caller's CLI-time default so a user
@@ -659,44 +640,9 @@ def _run_hitl(
                 logger.debug("Chrome relaunch during HITL failed", exc_info=True)
     _stop_hitl_listener(worker_id)
     _unregister_waiting(worker_id)
+    # Done means the human may have submitted. Keep the row protected and
+    # require reconciliation instead of launching another submitting agent.
+    reset_needs_human(job["url"])
     if stop_event is not None and stop_event.is_set():
         return None
-
-    # 9. Reset DB row.
-    reset_needs_human(job["url"])
-
-    # 9b. Pop the action log POSTed by the extension during the pause and
-    # format it for the agent's resume prompt (spec §4.4). If no log was
-    # posted (extension not ready, or user used the stdin fallback), this
-    # is a no-op and we resume without USER ACTIONS context.
-    with _action_log_cache_lock:
-        log_payload = _action_log_cache.pop(job_hash, None)
-    action_log_section = _format_action_log(log_payload) if log_payload else None
-
-    # 10. Re-launch agent with transient-error retry.
-    from applypilot.apply.launcher import run_job
-    last_result = None
-    last_dur = 0
-    last_qs: list[dict] = []
-    for _attempt in range(3):
-        if add_event:
-            add_event(f"[W{worker_id}] Human done, relaunching agent"
-                      f" (attempt {_attempt + 1}/3)...")
-        if update_state:
-            update_state(worker_id, status="applying",
-                         last_action=f"relaunching after HITL (attempt {_attempt + 1})",
-                         start_time=time.time(), actions=0)
-        last_result, last_dur, last_qs = run_job(
-            job, port=port, worker_id=worker_id,
-            model=model, dry_run=dry_run, skip_tab_reset=True,
-            extra_context=action_log_section)
-        _hitl_reason = last_result.split(":", 1)[-1] if ":" in last_result else last_result
-        if _hitl_reason not in _HITL_TRANSIENT_ERRORS:
-            break
-        if stop_event is not None and stop_event.is_set():
-            break
-        if _attempt < 2:
-            if add_event:
-                add_event(f"[W{worker_id}] Transient ({_hitl_reason}), retrying in 30s...")
-            time.sleep(30)
-    return last_result, last_dur, last_qs
+    return "unconfirmed", duration_ms or 0, []

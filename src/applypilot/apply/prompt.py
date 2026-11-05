@@ -545,6 +545,10 @@ def _build_qa_section(doc_format: str | None = None) -> str:
     return "\n".join(lines)
 
 
+class PromptBuildError(ValueError):
+    """The prompt could not be built; raised before any browser action, so the job is safe to retry."""
+
+
 def build_prompt(job: dict, tailored_resume: str,
                  cover_letter: str | None = None,
                  dry_run: bool = False,
@@ -570,14 +574,20 @@ def build_prompt(job: dict, tailored_resume: str,
     personal = profile["personal"]
 
     # --- Resolve resume document path ---
-    doc_ext = f".{doc_format}"
     resume_path = job.get("tailored_resume_path")
     if not resume_path:
-        raise ValueError(f"No tailored resume for job: {job.get('title', 'unknown')}")
+        raise PromptBuildError(f"No tailored resume for job: {job.get('title', 'unknown')}")
 
-    src_doc = Path(resume_path).with_suffix(doc_ext).resolve()
+    src_doc = Path(resume_path).with_suffix(f".{doc_format}").resolve()
     if not src_doc.exists():
-        raise ValueError(f"Resume {doc_format.upper()} not found: {src_doc}")
+        # Use the other format when only that one exists (e.g. PDF-only resume folders).
+        other = "pdf" if doc_format == "docx" else "docx"
+        alt = src_doc.with_suffix(f".{other}")
+        if not alt.exists():
+            raise PromptBuildError(f"Resume {doc_format.upper()} not found: {src_doc}")
+        logger.warning("Resume %s not found, using %s: %s", doc_format.upper(), other.upper(), alt)
+        doc_format, src_doc = other, alt
+    doc_ext = f".{doc_format}"
 
     # Copy to a clean filename for upload (recruiters see the filename)
     full_name = personal["full_name"]
@@ -968,7 +978,7 @@ in the KNOWN SCREENING ANSWERS section. The form will still be open in the brows
    - Compare every other field to the APPLICANT PROFILE. Fix mismatches. Fill empty fields.
 9. Answer screening questions using the rules above.
 10. {submit_instruction}
-11. After submit: browser_snapshot. Run CAPTCHA DETECT -- submit buttons often trigger invisible CAPTCHAs. If found, solve it (the form will auto-submit once the token clears, or you may need to click Submit again). Then check for new tabs (browser_tabs action: "list"). Switch to newest, close old. Snapshot to confirm submission. Look for "thank you" or "application received".
+11. After submit: browser_snapshot. Run CAPTCHA DETECT -- submit buttons often trigger invisible CAPTCHAs. If found, solve it (the form will auto-submit once the token clears). Never click Submit/Apply a second time. If no confirmation appears after the single click, output RESULT:UNCONFIRMED:{{url}}. Then check for new tabs (browser_tabs action: "list"). Switch to newest, close old. Snapshot to confirm submission. Look for "thank you" or "application received".
     CLEANUP (after confirming submission or any terminal result):
     - browser_tabs action "list" — get all open tabs in this window.
     - For each tab that is NOT the homepage (http://localhost:{server_port}/), close it:
@@ -982,6 +992,7 @@ Your VERY LAST message MUST contain exactly one RESULT: line from below. This is
 
 == RESULT CODES (output EXACTLY one) ==
 RESULT:APPLIED -- submitted successfully
+RESULT:UNCONFIRMED:{{url}} -- single submit click made, confirmation not observed; never submit again
 RESULT:ALREADY_APPLIED -- job was already applied to previously; no re-submission possible
 RESULT:EXPIRED -- job closed or no longer accepting applications
 RESULT:CAPTCHA -- blocked by unsolvable captcha
@@ -1158,9 +1169,7 @@ Signals that the application was already submitted:
 - A "thank you for your application" page that appeared WITHOUT you submitting anything
 - The apply button is replaced with "Applied" or "Withdraw Application"
 
-When you detect this, check for any UPDATE opportunity:
-- If there is a visible "Update application" / "Edit application" / "Resubmit" option → attempt to use it to re-upload the tailored resume and cover letter, then output RESULT:APPLIED
-- If no update option → output RESULT:ALREADY_APPLIED immediately, do NOT re-submit
+When you detect this, output RESULT:ALREADY_APPLIED immediately. Never update or resubmit an application already submitted.
 
 == CHECK ALL TABS BEFORE GIVING UP ==
 Before outputting ANY failure or NEEDS_HUMAN result, do this ONCE:
@@ -1176,7 +1185,7 @@ This is the #1 cause of premature failures — clicking Apply opens a new tab an
 forgets to switch to it, then gives up thinking nothing happened.
 
 == WHEN TO GIVE UP ==
-- Already applied and no update option detected -> RESULT:ALREADY_APPLIED
+- Already applied -> RESULT:ALREADY_APPLIED
 - Same page after 3 attempts with no progress, form has data entered -> RESULT:NEEDS_HUMAN:form_stuck:{{current_page_url}} (user finishes it)
 - Same page after 3 attempts, form is empty/blank/broken -> RESULT:FAILED:stuck
 - Screening questions you cannot confidently answer from the APPLICANT PROFILE or KNOWN SCREENING ANSWERS, and they appear to be required with no "skip" option -> RESULT:NEEDS_HUMAN:screening_questions:{{current_page_url}}

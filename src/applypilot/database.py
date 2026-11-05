@@ -268,6 +268,9 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
 
     # Run migrations for any columns added after initial schema
     ensure_columns(conn)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_application_status ON jobs(application_url, apply_status, url)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_apply_order ON jobs(fit_score DESC, COALESCE(discovered_at, '') DESC, url)")
+    commit_with_retry(conn)
 
     # Backfill apply categories for existing rows
     backfill_categories(conn)
@@ -329,6 +332,9 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_error": "TEXT",
     "apply_attempts": "INTEGER DEFAULT 0",
     "agent_id": "TEXT",
+    "worker_pid": "INTEGER",
+    "worker_host": "TEXT",
+    "lease_token": "TEXT",
     "last_attempted_at": "TEXT",
     "apply_duration_ms": "INTEGER",
     "apply_task_id": "TEXT",
@@ -483,7 +489,7 @@ VALID_STATES: frozenset[str] = frozenset({
     "scored", "score_failed", "low_score",
     "tailoring", "tailored", "tailor_failed",
     "cover_writing", "cover_failed",
-    "ready_to_apply", "applying", "applied",
+    "ready_to_apply", "applying", "applied", "unconfirmed",
     "apply_failed", "needs_human", "manual_only",
     "responded", "interview", "offer",
     "rejected", "ghosted", "archived",
@@ -502,7 +508,8 @@ VALID_TRANSITIONS: dict[str, frozenset[str]] = {
     "cover_writing":  frozenset({"ready_to_apply", "cover_failed"}),
     "cover_failed":   frozenset({"cover_writing", "ready_to_apply", "archived"}),
     "ready_to_apply": frozenset({"applying", "manual_only", "archived"}),
-    "applying":       frozenset({"applied", "apply_failed", "needs_human", "ready_to_apply"}),
+    "applying":       frozenset({"applied", "unconfirmed", "apply_failed", "needs_human", "ready_to_apply"}),
+    "unconfirmed":    frozenset({"applied", "archived"}),
     "apply_failed":   frozenset({"applying", "manual_only", "archived"}),
     "needs_human":    frozenset({"applying", "applied", "manual_only", "archived"}),
     "manual_only":    frozenset({"applied", "archived"}),
@@ -646,6 +653,8 @@ def backfill_states(conn: sqlite3.Connection | None = None) -> dict[str, int]:
             state = "responded"
         elif apply_status == "applied":
             state = "applied"
+        elif apply_status == "unconfirmed":
+            state = "unconfirmed"
         elif apply_status == "failed":
             state = "apply_failed"
         elif apply_status == "manual":
@@ -731,6 +740,8 @@ def categorize_apply_result(apply_status: str | None,
     """
     if apply_status is None:
         return "pending"
+    if apply_status in ("unconfirmed", "excluded_roster", "dry_run"):
+        return apply_status
     if apply_status == "applied":
         return "applied"
     if apply_status == "in_progress":
@@ -848,6 +859,7 @@ def reset_by_category(category: str,
                        needs_human_url = NULL,
                        needs_human_instructions = NULL
         WHERE apply_category = ?
+          AND COALESCE(apply_status, '') NOT IN ('applied', 'unconfirmed', 'in_progress', 'excluded_roster')
     """, (category,))
     commit_with_retry(conn)
     return cursor.rowcount
@@ -1688,7 +1700,7 @@ def get_in_flight_by_company(conn: sqlite3.Connection | None = None,
         SELECT company, site, strategy, application_url, url,
                COALESCE(applied_at, last_attempted_at) AS ts
         FROM jobs
-        WHERE apply_status IN ('applied', 'in_progress', 'needs_human')
+        WHERE apply_status IN ('applied', 'unconfirmed', 'in_progress', 'needs_human')
           AND COALESCE(applied_at, last_attempted_at) IS NOT NULL
           AND COALESCE(applied_at, last_attempted_at) > datetime('now', ?)
     """, (f"-{max_window_days} days",)).fetchall()

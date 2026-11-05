@@ -33,6 +33,7 @@ from rich.console import Console
 from rich.live import Live
 
 from applypilot import config
+from applypilot.apply.prompt import PromptBuildError
 from applypilot.apply.chrome import (
     BASE_CDP_PORT,
     _AdoptedChromeProcess,
@@ -111,26 +112,30 @@ def _probe_for_reconnect(worker_id: int, port: int) -> tuple[int | None, str | N
     try:
         conn = get_connection()
         row = conn.execute(
-            "SELECT url, application_url, title FROM jobs "
+            "SELECT url, application_url, title, worker_pid, worker_host FROM jobs "
             "WHERE apply_status = 'in_progress' AND agent_id = ? "
             "ORDER BY last_attempted_at DESC LIMIT 1",
             (f"worker-{worker_id}",),
         ).fetchone()
         if row:
+            from applypilot.apply.launcher import _worker_may_be_alive
+            if _worker_may_be_alive(row["worker_pid"], row["worker_host"]):
+                return None, None
             job_url = row["url"]
             apply_url = row["application_url"] or row["url"]
             title = row["title"] or apply_url
-            # Reset the lock so acquire_job() can re-acquire it normally
+            # The interrupted run may have submitted; never re-acquire it.
             conn.execute(
-                "UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url = ?",
+                "UPDATE jobs SET apply_status = 'unconfirmed', apply_category = 'unconfirmed', agent_id = NULL WHERE url = ?",
                 (job_url,),
             )
+            transition_state(conn, job_url, "unconfirmed", reason="worker interrupted", force=True)
             commit_with_retry(conn)
             add_event(
-                f"[W{worker_id}] Found interrupted job: {title[:40]} — will resume"
+                f"[W{worker_id}] Interrupted job needs confirmation: {title[:40]}"
             )
-            logger.info("[W%d] Interrupted job reset for reconnect: %s", worker_id, apply_url[:80])
-            return pid, apply_url
+            logger.info("[W%d] Interrupted job marked unconfirmed: %s", worker_id, apply_url[:80])
+            return pid, None
         else:
             add_event(f"[W{worker_id}] No interrupted job found — Chrome has next job")
             return pid, None
@@ -313,20 +318,23 @@ def _worker_loop_body(
                 relaunch = False
 
                 if result == "skipped":
-                    release_lock(job["url"])
+                    release_lock(job["url"], lease_token=job.get("lease_token"))
                     add_event(f"[W{worker_id}] Skipped: {(job.get('title') or '')[:30]}")
                     was_skipped = True
                     break
                 elif "credits_exhausted" in result:
                     reason = result.split(":", 1)[-1] if ":" in result else result
                     mark_result(job["url"], "failed", reason, permanent=True,
-                                duration_ms=duration_ms)
+                                duration_ms=duration_ms, lease_token=job.get("lease_token"))
                     _log_failed_attempt(job, reason, worker_id, duration_ms, True)
                     failed += 1
                     _stop_event.set()
                     break
+                elif result == "unconfirmed" or result == "dry_run":
+                    mark_result(job["url"], result, duration_ms=duration_ms, lease_token=job.get("lease_token"))
+                    break
                 elif result == "applied":
-                    mark_result(job["url"], "applied", duration_ms=duration_ms)
+                    mark_result(job["url"], "applied", duration_ms=duration_ms, lease_token=job.get("lease_token"))
                     _record_job_history(worker_id, job, result, duration_ms)
                     applied += 1
                     update_state(worker_id, jobs_applied=applied,
@@ -498,7 +506,7 @@ def _worker_loop_body(
                     else:
                         perm = _is_permanent_failure(result)
                         mark_result(job["url"], "failed", reason,
-                                    permanent=perm, duration_ms=duration_ms)
+                                    permanent=perm, duration_ms=duration_ms, lease_token=job.get("lease_token"))
                         _log_failed_attempt(job, reason, worker_id, duration_ms, perm)
                         _record_job_history(worker_id, job, result, duration_ms)
                         failed += 1
@@ -506,7 +514,7 @@ def _worker_loop_body(
                                      jobs_done=applied + failed)
 
         except KeyboardInterrupt:
-            release_lock(job["url"])
+            mark_result(job["url"], "unconfirmed", "worker interrupted", lease_token=job.get("lease_token"))
             if _stop_event.is_set():
                 break
             add_event(f"[W{worker_id}] Job skipped (Ctrl+C)")
@@ -515,7 +523,11 @@ def _worker_loop_body(
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {type(e).__name__}: {str(e)[:35]}")
             _log_failed_attempt(job, f"launcher_error:{str(e)[:80]}", worker_id, 0, False)
-            release_lock(job["url"])
+            if isinstance(e, PromptBuildError):
+                # Nothing was sent to the agent, so no submit can have happened: retryable failure.
+                mark_result(job["url"], "failed", f"prompt_build:{str(e)[:120]}", lease_token=job.get("lease_token"))
+            else:
+                mark_result(job["url"], "unconfirmed", "worker crashed", lease_token=job.get("lease_token"))
             failed += 1
             update_state(worker_id, jobs_failed=failed)
         finally:
@@ -616,35 +628,11 @@ def main(limit: int = 1, target_url: str | None = None,
     console = Console()
     _prev_focus_mode: str | None = None  # set before workers start; restored in finally
 
-    # Re-queue any jobs stuck in needs_human from a previous session.
-    # Their Chrome windows are gone (killed by _kill_on_port() when workers start),
-    # so reset them to NULL so they get picked up as normal jobs.
-    _boot_conn = get_connection()
-    # P0.5 leak (d) from decision #31: pull URLs first, then bulk-update,
-    # then emit per-row state transitions back to ready_to_apply.
-    _nh_urls = [r[0] for r in _boot_conn.execute(
-        "SELECT url FROM jobs WHERE apply_status='needs_human'"
-    ).fetchall()]
-    _nh_count = len(_nh_urls)
-    if _nh_count > 0:
-        _boot_conn.execute(
-            "UPDATE jobs SET apply_status=NULL, apply_category=NULL, "
-            "needs_human_reason=NULL, needs_human_url=NULL, "
-            "needs_human_instructions=NULL WHERE apply_status='needs_human'"
-        )
-        for _nh_url in _nh_urls:
-            try:
-                transition_state(
-                    _boot_conn, _nh_url, "ready_to_apply",
-                    reason="startup re-queue from needs_human",
-                    force=True,
-                )
-            except Exception:
-                logger.debug("startup re-queue transition failed for %s",
-                             _nh_url[:60], exc_info=True)
-        commit_with_retry(_boot_conn)
-        console.print(f"[yellow]Re-queued {_nh_count} needs_human job(s) from previous session[/yellow]")
-        logger.info("Startup: re-queued %d needs_human jobs from previous session", _nh_count)
+    # A human may have submitted before the previous session ended.
+    from applypilot.apply.hitl import reset_needs_human
+    _nh_count = reset_needs_human()
+    if _nh_count:
+        logger.info("Startup: quarantined %d interrupted human reviews", _nh_count)
 
     if continuous:
         effective_limit = 0

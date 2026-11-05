@@ -86,7 +86,7 @@ def test_mark_needs_human_transitions_to_needs_human(tmp_db, seed_job):
 # B2 — reset_needs_human → 'applying'
 # ---------------------------------------------------------------------------
 
-def test_reset_needs_human_transitions_to_applying(tmp_db, seed_job):
+def test_reset_needs_human_transitions_to_unconfirmed(tmp_db, seed_job):
     conn = tmp_db()
     row = _seed_needs_human(conn, seed_job, "nh-b2")
     url = row["url"]
@@ -95,10 +95,10 @@ def test_reset_needs_human_transitions_to_applying(tmp_db, seed_job):
     count = reset_needs_human(url=url)
 
     assert count == 1, f"Expected 1 row reset, got {count}"
-    assert current_state(conn, url) == "applying"
+    assert current_state(conn, url) == "unconfirmed"
     history = state_history(conn, url)
     reasons = [h["reason"] for h in history]
-    assert any("applying" in (r or "") or "needs_human resolved" in (r or "")
+    assert any("reconciliation" in (r or "")
                for r in reasons), (
         f"Expected transition reason mentioning 'applying' or 'resolved'; got {reasons}"
     )
@@ -195,7 +195,7 @@ def test_reset_failed_transitions_to_ready_to_apply(tmp_db, seed_job):
 # B6 — release_lock reverts applying → ready_to_apply
 # ---------------------------------------------------------------------------
 
-def test_release_lock_reverts_applying_to_ready_to_apply(tmp_db, seed_job):
+def test_release_lock_quarantines_interrupted_agent(tmp_db, seed_job):
     """When --gen or worker abandons a held job, state must revert."""
     conn = tmp_db()
     row = _seed_applying(conn, seed_job, "rl-b6")
@@ -206,9 +206,20 @@ def test_release_lock_reverts_applying_to_ready_to_apply(tmp_db, seed_job):
     from applypilot.apply.launcher import release_lock
     release_lock(url)
 
-    assert current_state(conn, url) == "ready_to_apply"
+    assert current_state(conn, url) == "unconfirmed"
     history = state_history(conn, url)
     reasons = [h["reason"] for h in history]
     assert any("lock released" in (r or "") for r in reasons), (
         f"Expected transition reason mentioning 'lock released'; got {reasons}"
     )
+
+
+@pytest.mark.parametrize("status", ["unconfirmed", "excluded_roster"])
+def test_resets_preserve_protected_status(tmp_db, seed_job, status):
+    from applypilot.apply.launcher import mark_result, reset_failed
+    from applypilot.database import reset_by_category
+    conn = tmp_db()
+    job = seed_job(conn, apply_status=status, apply_category="blocked_technical")
+    assert reset_failed() == 0
+    assert reset_by_category("blocked_technical", conn) == 0
+    assert conn.execute("SELECT apply_status FROM jobs WHERE url=?", (job["url"],)).fetchone()[0] == status
